@@ -84,14 +84,18 @@ func TestClient_PrefersBodyOverNotFound(t *testing.T) {
 }
 
 func TestClient_LosingServerRequestIsCancelled(t *testing.T) {
+	loserStarted := make(chan struct{})
 	loserCancelled := make(chan struct{})
 	loserSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(loserStarted)
 		<-r.Context().Done()
 		close(loserCancelled)
 	}))
 	defer loserSrv.Close()
 
+	// Block the winner until the loser's handler is running, so the loser request is guaranteed to be in flight when fanout cancels it.
 	winnerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-loserStarted
 		fmt.Fprint(w, "winner")
 	}))
 	defer winnerSrv.Close()
