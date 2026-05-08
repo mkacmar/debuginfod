@@ -200,8 +200,7 @@ func (c *Client) FetchSource(ctx context.Context, buildID string, sourcePath str
 }
 
 // FetchSection fetches a specific ELF section for the given build ID.
-// When the full debuginfo is already cached locally, the section is sliced out without going to the network.
-// The network endpoint is not supported by all debuginfod servers.
+// If the server doesn't support the /section/ endpoint, falls back to fetching the full debuginfo and slicing the section from it.
 func (c *Client) FetchSection(ctx context.Context, buildID string, sectionName string) (io.ReadCloser, error) {
 	id, err := parseBuildID(buildID)
 	if err != nil {
@@ -218,7 +217,74 @@ func (c *Client) FetchSection(ctx context.Context, buildID string, sectionName s
 			return rc, err
 		}
 	}
-	return c.fetch(ctx, key, urlPath)
+
+	rc, err := c.fetch(ctx, key, urlPath)
+	if err == nil {
+		return rc, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+
+	// Server doesn't support the section endpoint, or it doesn't have this section.
+	// Fetch the full debuginfo and slice the section from it.
+	c.logger.Debug("section endpoint unavailable, falling back to full debuginfo",
+		slog.String("buildID", id),
+		slog.String("section", sectionName),
+	)
+	return c.fetchSectionViaDebugInfo(ctx, id, sectionName)
+}
+
+// fetchSectionViaDebugInfo fetches the full debuginfo for buildID, slices out the requested section,
+// and caches the section if a cache is configured.
+func (c *Client) fetchSectionViaDebugInfo(ctx context.Context, buildID, sectionName string) (io.ReadCloser, error) {
+	debugRC, err := c.FetchDebugInfo(ctx, buildID)
+	if err != nil {
+		return nil, err
+	}
+	defer debugRC.Close()
+
+	ra, ok := debugRC.(io.ReaderAt)
+	if !ok {
+		data, err := io.ReadAll(debugRC)
+		if err != nil {
+			return nil, fmt.Errorf("debuginfod: read debuginfo for section %q: %w", sectionName, err)
+		}
+		ra = bytes.NewReader(data)
+	}
+
+	elfFile, err := elf.NewFile(ra)
+	if err != nil {
+		return nil, fmt.Errorf("debuginfod: parse debuginfo for section %q: %w", sectionName, err)
+	}
+	defer elfFile.Close()
+
+	sec := elfFile.Section(sectionName)
+	if sec == nil {
+		return nil, ErrNotFound
+	}
+
+	sectionData, err := io.ReadAll(sec.Open())
+	if err != nil {
+		return nil, fmt.Errorf("debuginfod: read section %q: %w", sectionName, err)
+	}
+
+	if c.cache != nil {
+		sectionKey := Key{BuildID: buildID, Kind: KindSection, Qualifier: sectionName}
+		if putErr := c.cache.Put(ctx, sectionKey, bytes.NewReader(sectionData)); putErr != nil {
+			c.logger.Warn("section cache put failed",
+				slog.String("buildID", buildID),
+				slog.String("section", sectionName),
+				slog.Any("error", putErr),
+			)
+		}
+	}
+
+	c.logger.Debug("section sliced from fetched debuginfo",
+		slog.String("buildID", buildID),
+		slog.String("section", sectionName),
+	)
+	return io.NopCloser(bytes.NewReader(sectionData)), nil
 }
 
 // tryLocalSection serves a section from cache or by slicing cached debuginfo.
