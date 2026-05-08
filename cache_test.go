@@ -22,10 +22,7 @@ func TestNewDiskCache_RejectEmptyDir(t *testing.T) {
 }
 
 func TestDiskCache_PutGet(t *testing.T) {
-	cache, err := NewDiskCache(DiskCacheOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	cache := newTestDiskCache(t)
 	ctx := context.Background()
 	key := Key{BuildID: "abcdef1234567890", Kind: KindDebugInfo}
 	data := []byte("ELF debug data here")
@@ -51,10 +48,7 @@ func TestDiskCache_PutGet(t *testing.T) {
 }
 
 func TestDiskCache_GetMissing(t *testing.T) {
-	cache, err := NewDiskCache(DiskCacheOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	cache := newTestDiskCache(t)
 
 	rc, err := cache.Get(context.Background(), Key{BuildID: "nonexistent", Kind: KindDebugInfo})
 	if !errors.Is(err, ErrNotFound) {
@@ -67,10 +61,7 @@ func TestDiskCache_GetMissing(t *testing.T) {
 }
 
 func TestDiskCache_Delete(t *testing.T) {
-	cache, err := NewDiskCache(DiskCacheOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	cache := newTestDiskCache(t)
 	ctx := context.Background()
 	key := Key{BuildID: "abcdef1234567890", Kind: KindDebugInfo}
 
@@ -93,10 +84,7 @@ func TestDiskCache_Delete(t *testing.T) {
 }
 
 func TestDiskCache_DeleteMissing(t *testing.T) {
-	cache, err := NewDiskCache(DiskCacheOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	cache := newTestDiskCache(t)
 
 	if err := cache.Delete(context.Background(), Key{BuildID: "nonexistent", Kind: KindDebugInfo}); err != nil {
 		t.Errorf("delete of missing key should return nil, got %v", err)
@@ -104,10 +92,7 @@ func TestDiskCache_DeleteMissing(t *testing.T) {
 }
 
 func TestDiskCache_PutReadOnly(t *testing.T) {
-	cache, err := NewDiskCache(DiskCacheOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	cache := newTestDiskCache(t)
 	ctx := context.Background()
 	key := Key{BuildID: "aabbccdd", Kind: KindDebugInfo}
 
@@ -129,11 +114,7 @@ func TestDiskCache_PutReadOnly(t *testing.T) {
 }
 
 func TestDiskCache_RejectsTraversal(t *testing.T) {
-	dir := t.TempDir()
-	cache, err := NewDiskCache(DiskCacheOptions{Dir: dir})
-	if err != nil {
-		t.Fatal(err)
-	}
+	cache := newTestDiskCache(t)
 	ctx := context.Background()
 
 	for _, qualifier := range []string{"/../etc/passwd", "/usr/../../../escape", "/./still/bad/.."} {
@@ -143,10 +124,10 @@ func TestDiskCache_RejectsTraversal(t *testing.T) {
 		}
 	}
 
-	parent := filepath.Dir(dir)
+	parent := filepath.Dir(cache.dir)
 	if entries, _ := os.ReadDir(parent); len(entries) > 1 {
 		for _, e := range entries {
-			if e.Name() != filepath.Base(dir) {
+			if e.Name() != filepath.Base(cache.dir) {
 				t.Errorf("traversal escaped cache dir: %s", filepath.Join(parent, e.Name()))
 			}
 		}
@@ -154,10 +135,7 @@ func TestDiskCache_RejectsTraversal(t *testing.T) {
 }
 
 func TestDiskCache_RejectsBadKey(t *testing.T) {
-	cache, err := NewDiskCache(DiskCacheOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	cache := newTestDiskCache(t)
 	ctx := context.Background()
 
 	cases := []struct {
@@ -262,4 +240,13 @@ func TestClient_CachePutFailure(t *testing.T) {
 	if string(got) != body {
 		t.Errorf("got %q, want %q", got, body)
 	}
+}
+
+func newTestDiskCache(t *testing.T) *DiskCache {
+	t.Helper()
+	cache, err := NewDiskCache(DiskCacheOptions{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cache
 }
