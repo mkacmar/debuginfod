@@ -291,13 +291,27 @@ func (c *Client) fetchSectionViaDebugInfo(ctx context.Context, buildID, sectionN
 // A nil return for both values means the caller should go to the network.
 func (c *Client) tryLocalSection(ctx context.Context, buildID, sectionName string) (io.ReadCloser, error) {
 	sectionKey := Key{BuildID: buildID, Kind: KindSection, Qualifier: sectionName}
-	if rc, err := c.cache.Get(ctx, sectionKey); err == nil {
+	rc, err := c.cache.Get(ctx, sectionKey)
+	if err == nil {
 		c.logger.Debug("section cache hit", slog.String("buildID", buildID), slog.String("section", sectionName))
 		return rc, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		c.logger.Warn("section cache get failed",
+			slog.String("buildID", buildID),
+			slog.String("section", sectionName),
+			slog.Any("error", err),
+		)
 	}
 
 	debugRC, err := c.cache.Get(ctx, Key{BuildID: buildID, Kind: KindDebugInfo})
 	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			c.logger.Warn("debuginfo cache get failed",
+				slog.String("buildID", buildID),
+				slog.Any("error", err),
+			)
+		}
 		return nil, nil
 	}
 	defer debugRC.Close()
