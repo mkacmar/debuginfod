@@ -159,6 +159,45 @@ func TestClient_FetchSection_EvictsCorruptCachedDebugInfo(t *testing.T) {
 	}
 }
 
+func TestClient_FetchSection_LocalSliceFromNonSeekableCache(t *testing.T) {
+	const sectionName = ".text"
+	sectionContent := []byte("section payload")
+	debugInfo := makeMinimalELF(sectionName, sectionContent)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected network request: %s", r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	cache := newMemCache()
+	ctx := context.Background()
+	if err := putReader(ctx, cache, Key{BuildID: testBuildID, Kind: KindDebugInfo}, bytes.NewReader(debugInfo)); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := NewClient(Options{
+		ServerURLs: []string{srv.URL},
+		Cache:      cache,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rc, err := client.FetchSection(ctx, testBuildID, sectionName)
+	if err != nil {
+		t.Fatalf("FetchSection: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	if !bytes.Equal(got, sectionContent) {
+		t.Errorf("section content = %q, want %q", got, sectionContent)
+	}
+}
+
 // fallbackServer serves debugInfo at /debuginfo and 404s the /section/ endpoint, simulating a server without section support.
 // sectionHits and debugInfoHits, if non-nil, count requests to each endpoint.
 func fallbackServer(t *testing.T, sectionName string, debugInfo []byte, sectionHits, debugInfoHits *atomic.Int32) *httptest.Server {

@@ -319,7 +319,18 @@ func (c *Client) tryLocalSection(ctx context.Context, buildID, sectionName strin
 
 	ra, ok := debugRC.(io.ReaderAt)
 	if !ok {
-		return nil, nil
+		c.logger.Debug("cached debuginfo not seekable, buffering for local slice",
+			slog.String("buildID", buildID),
+		)
+		data, err := io.ReadAll(debugRC)
+		if err != nil {
+			c.logger.Warn("cached debuginfo read failed",
+				slog.String("buildID", buildID),
+				slog.Any("error", err),
+			)
+			return nil, nil
+		}
+		ra = bytes.NewReader(data)
 	}
 
 	elfFile, err := elf.NewFile(ra)
