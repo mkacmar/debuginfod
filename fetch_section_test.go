@@ -108,6 +108,57 @@ func TestClient_FetchSection_FallbackWithoutCache(t *testing.T) {
 	}
 }
 
+func TestClient_FetchSection_EvictsCorruptCachedDebugInfo(t *testing.T) {
+	const sectionName = ".text"
+	sectionContent := []byte("section payload")
+	debugInfo := makeMinimalELF(sectionName, sectionContent)
+
+	srv := fallbackServer(t, sectionName, debugInfo, nil, nil)
+	defer srv.Close()
+
+	cache := newTestDiskCache(t)
+	ctx := context.Background()
+
+	debugKey := Key{BuildID: testBuildID, Kind: KindDebugInfo}
+	if err := putReader(ctx, cache, debugKey, bytes.NewReader([]byte("not an elf file"))); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := NewClient(Options{
+		ServerURLs: []string{srv.URL},
+		Cache:      cache,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rc, err := client.FetchSection(ctx, testBuildID, sectionName)
+	if err != nil {
+		t.Fatalf("FetchSection: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	if !bytes.Equal(got, sectionContent) {
+		t.Errorf("section content = %q, want %q", got, sectionContent)
+	}
+
+	cachedRC, err := cache.Get(ctx, debugKey)
+	if err != nil {
+		t.Fatalf("debuginfo not cached after refetch: %v", err)
+	}
+	cached, err := io.ReadAll(cachedRC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachedRC.Close()
+	if !bytes.Equal(cached, debugInfo) {
+		t.Errorf("cached debuginfo not replaced with valid bytes (got %d bytes, want %d)", len(cached), len(debugInfo))
+	}
+}
+
 // fallbackServer serves debugInfo at /debuginfo and 404s the /section/ endpoint, simulating a server without section support.
 // sectionHits and debugInfoHits, if non-nil, count requests to each endpoint.
 func fallbackServer(t *testing.T, sectionName string, debugInfo []byte, sectionHits, debugInfoHits *atomic.Int32) *httptest.Server {

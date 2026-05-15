@@ -271,11 +271,11 @@ func (c *Client) fetchSectionViaDebugInfo(ctx context.Context, buildID, sectionN
 
 	if c.cache != nil {
 		sectionKey := Key{BuildID: buildID, Kind: KindSection, Qualifier: sectionName}
-		if putErr := putReader(ctx, c.cache, sectionKey, bytes.NewReader(sectionData)); putErr != nil {
+		if err := putReader(ctx, c.cache, sectionKey, bytes.NewReader(sectionData)); err != nil {
 			c.logger.Warn("section cache put failed",
 				slog.String("buildID", buildID),
 				slog.String("section", sectionName),
-				slog.Any("error", putErr),
+				slog.Any("error", err),
 			)
 		}
 	}
@@ -304,7 +304,8 @@ func (c *Client) tryLocalSection(ctx context.Context, buildID, sectionName strin
 		)
 	}
 
-	debugRC, err := c.cache.Get(ctx, Key{BuildID: buildID, Kind: KindDebugInfo})
+	debugKey := Key{BuildID: buildID, Kind: KindDebugInfo}
+	debugRC, err := c.cache.Get(ctx, debugKey)
 	if err != nil {
 		if !errors.Is(err, ErrNotFound) {
 			c.logger.Warn("debuginfo cache get failed",
@@ -323,10 +324,16 @@ func (c *Client) tryLocalSection(ctx context.Context, buildID, sectionName strin
 
 	elfFile, err := elf.NewFile(ra)
 	if err != nil {
-		c.logger.Debug("cached debuginfo not parseable as ELF",
+		c.logger.Warn("cached debuginfo not parseable as ELF, evicting",
 			slog.String("buildID", buildID),
 			slog.Any("error", err),
 		)
+		if err := c.cache.Delete(ctx, debugKey); err != nil {
+			c.logger.Warn("debuginfo cache delete failed",
+				slog.String("buildID", buildID),
+				slog.Any("error", err),
+			)
+		}
 		return nil, nil
 	}
 	defer elfFile.Close()
@@ -342,14 +349,25 @@ func (c *Client) tryLocalSection(ctx context.Context, buildID, sectionName strin
 
 	data, err := io.ReadAll(sec.Open())
 	if err != nil {
+		c.logger.Warn("cached debuginfo section read failed, evicting",
+			slog.String("buildID", buildID),
+			slog.String("section", sectionName),
+			slog.Any("error", err),
+		)
+		if err := c.cache.Delete(ctx, debugKey); err != nil {
+			c.logger.Warn("debuginfo cache delete failed",
+				slog.String("buildID", buildID),
+				slog.Any("error", err),
+			)
+		}
 		return nil, fmt.Errorf("debuginfod: read section %q from cached debuginfo: %w", sectionName, err)
 	}
 
-	if putErr := putReader(ctx, c.cache, sectionKey, bytes.NewReader(data)); putErr != nil {
+	if err := putReader(ctx, c.cache, sectionKey, bytes.NewReader(data)); err != nil {
 		c.logger.Warn("section cache put failed",
 			slog.String("buildID", buildID),
 			slog.String("section", sectionName),
-			slog.Any("error", putErr),
+			slog.Any("error", err),
 		)
 	}
 
