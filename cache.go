@@ -221,7 +221,7 @@ func (c *DiskCache) path(k Key) (string, error) {
 		if k.Qualifier == "" {
 			return "", fmt.Errorf("debuginfod: cache key %s requires qualifier", k)
 		}
-		segs, err := safeSourceSegments(k.Qualifier)
+		segs, err := sourcePathSegments(k.Qualifier)
 		if err != nil {
 			return "", fmt.Errorf("debuginfod: cache key %s: %w", k, err)
 		}
@@ -230,8 +230,8 @@ func (c *DiskCache) path(k Key) (string, error) {
 	return "", fmt.Errorf("debuginfod: cache key %s has unknown kind", k)
 }
 
-// safeSourceSegments URL-escapes each path segment and rejects "." / ".." segments.
-func safeSourceSegments(p string) ([]string, error) {
+// sourcePathSegments URL-escapes each path segment and rejects "." / ".." segments.
+func sourcePathSegments(p string) ([]string, error) {
 	var out []string
 	for _, seg := range strings.Split(p, "/") {
 		if seg == "" {

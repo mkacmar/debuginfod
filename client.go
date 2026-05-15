@@ -149,7 +149,7 @@ func normalizeServerURLs(urls []string) ([]string, error) {
 	return out, nil
 }
 
-func parseBuildID(buildID string) (string, error) {
+func validateBuildID(buildID string) (string, error) {
 	if buildID == "" {
 		return "", fmt.Errorf("debuginfod: build ID is empty")
 	}
@@ -167,7 +167,7 @@ func parseBuildID(buildID string) (string, error) {
 // FetchDebugInfo fetches the debug info file for the given build ID.
 // Returns an io.ReadCloser the caller must close.
 func (c *Client) FetchDebugInfo(ctx context.Context, buildID string) (io.ReadCloser, error) {
-	id, err := parseBuildID(buildID)
+	id, err := validateBuildID(buildID)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +176,7 @@ func (c *Client) FetchDebugInfo(ctx context.Context, buildID string) (io.ReadClo
 
 // FetchExecutable fetches the executable for the given build ID.
 func (c *Client) FetchExecutable(ctx context.Context, buildID string) (io.ReadCloser, error) {
-	id, err := parseBuildID(buildID)
+	id, err := validateBuildID(buildID)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +185,7 @@ func (c *Client) FetchExecutable(ctx context.Context, buildID string) (io.ReadCl
 
 // FetchSource fetches a source file for the given build ID and absolute source path.
 func (c *Client) FetchSource(ctx context.Context, buildID string, sourcePath string) (io.ReadCloser, error) {
-	id, err := parseBuildID(buildID)
+	id, err := validateBuildID(buildID)
 	if err != nil {
 		return nil, err
 	}
@@ -196,13 +196,13 @@ func (c *Client) FetchSource(ctx context.Context, buildID string, sourcePath str
 		return nil, fmt.Errorf("debuginfod: source path must be absolute (start with /): %q", sourcePath)
 	}
 	key := Key{BuildID: id, Kind: KindSource, Qualifier: sourcePath}
-	return c.fetch(ctx, key, id+"/source"+escapePathSegments(sourcePath))
+	return c.fetch(ctx, key, id+"/source"+urlEscapeSourcePath(sourcePath))
 }
 
 // FetchSection fetches a specific ELF section for the given build ID.
 // If the server doesn't support the /section/ endpoint, falls back to fetching the full debuginfo and slicing the section from it.
 func (c *Client) FetchSection(ctx context.Context, buildID string, sectionName string) (io.ReadCloser, error) {
-	id, err := parseBuildID(buildID)
+	id, err := validateBuildID(buildID)
 	if err != nil {
 		return nil, err
 	}
@@ -411,8 +411,8 @@ func ExponentialBackoff(baseDelay, maxDelay time.Duration) (func(retry int) time
 	}, nil
 }
 
-// escapePathSegments URL-escapes each "/"-separated segment, preserving the separators.
-func escapePathSegments(p string) string {
+// urlEscapeSourcePath URL-escapes each "/"-separated segment, preserving the separators.
+func urlEscapeSourcePath(p string) string {
 	parts := strings.Split(p, "/")
 	for i, s := range parts {
 		parts[i] = url.PathEscape(s)
