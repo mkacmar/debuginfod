@@ -44,6 +44,9 @@ client, err := debuginfod.NewClient(debuginfod.Options{
 })
 ```
 
+The returned `ReadCloser` streams bytes as they arrive from upstream and into the cache concurrently.
+Closing it before EOF aborts the in-flight cache write so partial responses do not poison the cache.
+
 ### Retries
 
 Each retry round fans out across all configured servers in parallel. Only network failures trigger retries.

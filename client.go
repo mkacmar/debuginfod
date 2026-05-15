@@ -271,7 +271,7 @@ func (c *Client) fetchSectionViaDebugInfo(ctx context.Context, buildID, sectionN
 
 	if c.cache != nil {
 		sectionKey := Key{BuildID: buildID, Kind: KindSection, Qualifier: sectionName}
-		if putErr := c.cache.Put(ctx, sectionKey, bytes.NewReader(sectionData)); putErr != nil {
+		if putErr := putReader(ctx, c.cache, sectionKey, bytes.NewReader(sectionData)); putErr != nil {
 			c.logger.Warn("section cache put failed",
 				slog.String("buildID", buildID),
 				slog.String("section", sectionName),
@@ -331,7 +331,7 @@ func (c *Client) tryLocalSection(ctx context.Context, buildID, sectionName strin
 		return nil, fmt.Errorf("debuginfod: read section %q from cached debuginfo: %w", sectionName, err)
 	}
 
-	if putErr := c.cache.Put(ctx, sectionKey, bytes.NewReader(data)); putErr != nil {
+	if putErr := putReader(ctx, c.cache, sectionKey, bytes.NewReader(data)); putErr != nil {
 		c.logger.Warn("section cache put failed",
 			slog.String("buildID", buildID),
 			slog.String("section", sectionName),
@@ -391,32 +391,61 @@ func (c *Client) fetch(ctx context.Context, key Key, urlPath string) (io.ReadClo
 		c.logger.Warn("cache get failed", slog.String("key", key.String()), slog.Any("error", err))
 	}
 
-	if err := c.fetchAndCache(ctx, key, urlPath); err != nil {
+	body, err := c.fetchFromServers(ctx, urlPath)
+	if err != nil {
 		return nil, err
 	}
 
-	rc, err = c.cache.Get(ctx, key)
-	if err == nil {
-		return rc, nil
+	entry, err := c.cache.Create(ctx, key)
+	if err != nil {
+		c.logger.Warn("cache create failed", slog.String("key", key.String()), slog.Any("error", err))
+		return body, nil
 	}
-	// Cache write failed or entry vanished. Bypass cache.
-	return c.fetchFromServers(ctx, urlPath)
+
+	return c.streamThroughCache(key, body, entry), nil
 }
 
-func (c *Client) fetchAndCache(ctx context.Context, key Key, urlPath string) error {
-	rc, err := c.fetchFromServers(ctx, urlPath)
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
+// streamThroughCache fans bytes from body into both the cache entry and the caller's reader.
+// On clean EOF the entry is committed.
+// On any error or early caller Close the entry is discarded.
+func (c *Client) streamThroughCache(key Key, body io.ReadCloser, entry CacheEntry) io.ReadCloser {
+	pr, pw := io.Pipe()
 
-	if err := c.cache.Put(ctx, key, rc); err != nil {
-		c.logger.Warn("cache put failed", slog.String("key", key.String()), slog.Any("error", err))
-		return nil
-	}
+	go func() {
+		_, copyErr := io.Copy(io.MultiWriter(entry, pw), body)
+		_ = body.Close()
+		if copyErr != nil {
+			_ = entry.Close()
+			_ = pw.CloseWithError(copyErr)
+			c.logger.Debug("cache stream aborted", slog.String("key", key.String()), slog.Any("error", copyErr))
+			return
+		}
+		if cerr := entry.Commit(); cerr != nil {
+			c.logger.Warn("cache commit failed", slog.String("key", key.String()), slog.Any("error", cerr))
+		} else {
+			c.logger.Debug("cached artifact", slog.String("key", key.String()))
+		}
+		_ = entry.Close()
+		_ = pw.Close()
+	}()
 
-	c.logger.Debug("cached artifact", slog.String("key", key.String()))
-	return nil
+	return &cacheStreamReader{pr: pr, body: body}
+}
+
+// cacheStreamReader is the caller's view of a fetch that is being teed into a cache entry.
+// Closing it before EOF unblocks the copy goroutine, which then discards the staged entry.
+type cacheStreamReader struct {
+	pr   *io.PipeReader
+	body io.Closer
+}
+
+func (r *cacheStreamReader) Read(p []byte) (int, error) {
+	return r.pr.Read(p)
+}
+
+func (r *cacheStreamReader) Close() error {
+	_ = r.body.Close()
+	return r.pr.Close()
 }
 
 // fetchFromServers queries the configured servers in parallel.

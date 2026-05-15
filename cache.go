@@ -56,14 +56,39 @@ type Cache interface {
 	// Returns ErrNotFound if the key does not exist.
 	Get(ctx context.Context, k Key) (io.ReadCloser, error)
 
-	// Put stores the artifact from r under the given key.
-	// Put overwrites any existing entry for the key.
-	// Put is atomic: either the new entry is fully readable, or the cache is unchanged.
-	Put(ctx context.Context, k Key, r io.Reader) error
+	// Create opens a new staging entry for the given key.
+	// The caller writes bytes to the returned CacheEntry and then calls Commit to atomically promote them.
+	// Closing without Commit discards the staged bytes.
+	// Create overwrites any existing entry for the key on Commit.
+	Create(ctx context.Context, k Key) (CacheEntry, error)
 
 	// Delete removes the artifact for the given key.
 	// Returns nil if the key does not exist.
 	Delete(ctx context.Context, k Key) error
+}
+
+// CacheEntry is a writable staging handle for a new cache entry.
+// Commit atomically promotes the staged bytes, Close before Commit discards them.
+// Close must be idempotent and is a no-op after Commit.
+type CacheEntry interface {
+	io.WriteCloser
+	// Commit atomically promotes the staged bytes to a live entry.
+	// Commit returns ErrAlreadyCommitted if called more than once.
+	Commit() error
+}
+
+// putReader stores all bytes from r under key k.
+// It runs the full Create-Copy-Commit-Close lifecycle and aborts on any error.
+func putReader(ctx context.Context, c Cache, k Key, r io.Reader) error {
+	e, err := c.Create(ctx, k)
+	if err != nil {
+		return err
+	}
+	defer e.Close()
+	if _, err := io.Copy(e, r); err != nil {
+		return err
+	}
+	return e.Commit()
 }
 
 // DefaultCacheDir returns the platform default cache directory.
@@ -113,35 +138,65 @@ func (c *DiskCache) Get(_ context.Context, k Key) (io.ReadCloser, error) {
 	return f, nil
 }
 
-func (c *DiskCache) Put(_ context.Context, k Key, r io.Reader) error {
+func (c *DiskCache) Create(_ context.Context, k Key) (CacheEntry, error) {
 	p, err := c.path(k)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0750); err != nil {
-		return fmt.Errorf("debuginfod: cache put %s: %w", k, err)
+		return nil, fmt.Errorf("debuginfod: cache create %s: %w", k, err)
 	}
-
 	f, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
 	if err != nil {
-		return fmt.Errorf("debuginfod: cache put %s: %w", k, err)
+		return nil, fmt.Errorf("debuginfod: cache create %s: %w", k, err)
 	}
-	tmp := f.Name()
-	defer func() { _ = os.Remove(tmp) }()
-	defer func() { _ = f.Close() }()
+	return &diskCacheEntry{f: f, finalPath: p, key: k}, nil
+}
 
-	if _, err := io.Copy(f, r); err != nil {
-		return fmt.Errorf("debuginfod: cache put %s: %w", k, err)
+// diskCacheEntry stages bytes in a temp file and atomically renames to the final path on Commit.
+type diskCacheEntry struct {
+	f         *os.File
+	finalPath string
+	key       Key
+	committed bool
+	closed    bool
+}
+
+func (e *diskCacheEntry) Write(p []byte) (int, error) {
+	return e.f.Write(p)
+}
+
+func (e *diskCacheEntry) Commit() error {
+	if e.committed {
+		return ErrAlreadyCommitted
 	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("debuginfod: cache put %s: %w", k, err)
+	tmp := e.f.Name()
+	if err := e.f.Close(); err != nil {
+		return fmt.Errorf("debuginfod: cache commit %s: %w", e.key, err)
 	}
 	if err := os.Chmod(tmp, 0400); err != nil {
-		return fmt.Errorf("debuginfod: cache put %s: %w", k, err)
+		_ = os.Remove(tmp)
+		return fmt.Errorf("debuginfod: cache commit %s: %w", e.key, err)
 	}
-	if err := os.Rename(tmp, p); err != nil {
-		return fmt.Errorf("debuginfod: cache put %s: %w", k, err)
+	if err := os.Rename(tmp, e.finalPath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("debuginfod: cache commit %s: %w", e.key, err)
 	}
+	e.committed = true
+	return nil
+}
+
+func (e *diskCacheEntry) Close() error {
+	if e.closed {
+		return nil
+	}
+	e.closed = true
+	if e.committed {
+		return nil
+	}
+	tmp := e.f.Name()
+	_ = e.f.Close()
+	_ = os.Remove(tmp)
 	return nil
 }
 
