@@ -32,10 +32,10 @@ defer rc.Close()
 ### Caching
 
 ```go
-cacheDir, err := debuginfod.DefaultCacheDir()
+userCacheDir, err := os.UserCacheDir()
 
 cache, err := debuginfod.NewDiskCache(debuginfod.DiskCacheOptions{
-    Dir: cacheDir,
+    Dir: filepath.Join(userCacheDir, "debuginfod"),
 })
 
 client, err := debuginfod.NewClient(debuginfod.Options{

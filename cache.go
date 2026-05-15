@@ -91,15 +91,6 @@ func putReader(ctx context.Context, c Cache, k Key, r io.Reader) error {
 	return e.Commit()
 }
 
-// DefaultCacheDir returns the platform default cache directory.
-func DefaultCacheDir() (string, error) {
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return "", fmt.Errorf("debuginfod: failed to determine user cache directory: %w", err)
-	}
-	return filepath.Join(cacheDir, "debuginfod"), nil
-}
-
 // DiskCacheOptions configures a DiskCache.
 type DiskCacheOptions struct {
 	// Dir is the root directory for cached artifacts.
