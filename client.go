@@ -597,7 +597,7 @@ func (c *cancelOnClose) Close() error {
 func (c *Client) fetchFromServer(ctx context.Context, serverURL, urlPath string) (io.ReadCloser, bool, error) {
 	endpoint := fmt.Sprintf("%s/buildid/%s", strings.TrimSuffix(serverURL, "/"), urlPath)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, false, fmt.Errorf("%s: %w", serverURL, err)
 	}
