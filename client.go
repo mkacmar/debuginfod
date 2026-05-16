@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -417,28 +416,6 @@ func (c *Client) evictDebugInfo(ctx context.Context, key Key, buildID string) {
 			slog.Any("error", err),
 		)
 	}
-}
-
-// ExponentialBackoff returns a backoff function using the "Full Jitter" algorithm.
-// See https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
-func ExponentialBackoff(baseDelay, maxDelay time.Duration) (func(retry int) time.Duration, error) {
-	if baseDelay <= 0 {
-		return nil, fmt.Errorf("debuginfod: ExponentialBackoff: baseDelay must be positive, got %s", baseDelay)
-	}
-	if maxDelay < baseDelay {
-		return nil, fmt.Errorf("debuginfod: ExponentialBackoff: maxDelay (%s) must be >= baseDelay (%s)", maxDelay, baseDelay)
-	}
-	return func(retry int) time.Duration {
-		if retry < 1 {
-			return 0
-		}
-		delay := time.Duration(1<<uint(retry-1)) * baseDelay
-		if delay > maxDelay || delay <= 0 {
-			delay = maxDelay
-		}
-		jitter := time.Duration(rand.Int64N(int64(delay))) // #nosec G404 -- jitter, not security
-		return jitter
-	}, nil
 }
 
 // urlEscapeSourcePath URL-escapes each "/"-separated segment, preserving the separators.
