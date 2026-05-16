@@ -53,18 +53,18 @@ func TestDiskCache_DoubleCommit(t *testing.T) {
 	ctx := context.Background()
 	key := Key{BuildID: "aabbccdd", Kind: KindDebugInfo}
 
-	e, err := cache.Create(ctx, key)
+	entry, err := cache.Create(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.Close()
-	if _, err := e.Write([]byte("data")); err != nil {
+	defer entry.Close()
+	if _, err := entry.Write([]byte("data")); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Commit(); err != nil {
+	if err := entry.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Commit(); !errors.Is(err, ErrAlreadyCommitted) {
+	if err := entry.Commit(); !errors.Is(err, ErrAlreadyCommitted) {
 		t.Errorf("second Commit got %v, want ErrAlreadyCommitted", err)
 	}
 }
@@ -122,11 +122,11 @@ func TestDiskCache_CommittedEntryIsReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p, err := cache.path(key)
+	path, err := cache.path(key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(p)
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,9 +148,9 @@ func TestDiskCache_RejectsTraversal(t *testing.T) {
 
 	parent := filepath.Dir(cache.dir)
 	if entries, _ := os.ReadDir(parent); len(entries) > 1 {
-		for _, e := range entries {
-			if e.Name() != filepath.Base(cache.dir) {
-				t.Errorf("traversal escaped cache dir: %s", filepath.Join(parent, e.Name()))
+		for _, entry := range entries {
+			if entry.Name() != filepath.Base(cache.dir) {
+				t.Errorf("traversal escaped cache dir: %s", filepath.Join(parent, entry.Name()))
 			}
 		}
 	}

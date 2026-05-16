@@ -77,21 +77,20 @@ type CacheEntry interface {
 	Commit() error
 }
 
-// putReader stores all bytes from r under key k.
+// putReader stores all bytes from reader under key.
 // It runs the full Create-Copy-Commit-Close lifecycle and aborts on any error.
-func putReader(ctx context.Context, c Cache, k Key, r io.Reader) error {
-	e, err := c.Create(ctx, k)
+func putReader(ctx context.Context, cache Cache, key Key, reader io.Reader) error {
+	entry, err := cache.Create(ctx, key)
 	if err != nil {
 		return err
 	}
-	defer e.Close()
-	if _, err := io.Copy(e, r); err != nil {
+	defer entry.Close()
+	if _, err := io.Copy(entry, reader); err != nil {
 		return err
 	}
-	return e.Commit()
+	return entry.Commit()
 }
 
-// DiskCacheOptions configures a DiskCache.
 type DiskCacheOptions struct {
 	// Dir is the root directory for cached artifacts.
 	Dir string
@@ -103,7 +102,6 @@ type DiskCache struct {
 	dir string
 }
 
-// NewDiskCache creates a new DiskCache.
 func NewDiskCache(opts DiskCacheOptions) (*DiskCache, error) {
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("debuginfod: cache directory is required")
@@ -114,39 +112,39 @@ func NewDiskCache(opts DiskCacheOptions) (*DiskCache, error) {
 	return &DiskCache{dir: opts.Dir}, nil
 }
 
-func (c *DiskCache) Get(_ context.Context, k Key) (io.ReadCloser, error) {
-	p, err := c.path(k)
+func (c *DiskCache) Get(_ context.Context, key Key) (io.ReadCloser, error) {
+	path, err := c.path(key)
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.Open(p) // #nosec G304 -- path derived from configured cache directory
+	file, err := os.Open(path) // #nosec G304 -- path derived from configured cache directory
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("debuginfod: cache get %s: %w", k, err)
+		return nil, fmt.Errorf("debuginfod: cache get %s: %w", key, err)
 	}
-	return f, nil
+	return file, nil
 }
 
-func (c *DiskCache) Create(_ context.Context, k Key) (CacheEntry, error) {
-	p, err := c.path(k)
+func (c *DiskCache) Create(_ context.Context, key Key) (CacheEntry, error) {
+	path, err := c.path(key)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0750); err != nil {
-		return nil, fmt.Errorf("debuginfod: cache create %s: %w", k, err)
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return nil, fmt.Errorf("debuginfod: cache create %s: %w", key, err)
 	}
-	f, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
+	file, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
-		return nil, fmt.Errorf("debuginfod: cache create %s: %w", k, err)
+		return nil, fmt.Errorf("debuginfod: cache create %s: %w", key, err)
 	}
-	return &diskCacheEntry{f: f, finalPath: p, key: k}, nil
+	return &diskCacheEntry{file: file, finalPath: path, key: key}, nil
 }
 
 // diskCacheEntry stages bytes in a temp file and atomically renames to the final path on Commit.
 type diskCacheEntry struct {
-	f         *os.File
+	file      *os.File
 	finalPath string
 	key       Key
 	committed bool
@@ -154,23 +152,23 @@ type diskCacheEntry struct {
 }
 
 func (e *diskCacheEntry) Write(p []byte) (int, error) {
-	return e.f.Write(p)
+	return e.file.Write(p)
 }
 
 func (e *diskCacheEntry) Commit() error {
 	if e.committed {
 		return ErrAlreadyCommitted
 	}
-	tmp := e.f.Name()
-	if err := e.f.Close(); err != nil {
+	tempPath := e.file.Name()
+	if err := e.file.Close(); err != nil {
 		return fmt.Errorf("debuginfod: cache commit %s: %w", e.key, err)
 	}
-	if err := os.Chmod(tmp, 0400); err != nil {
-		_ = os.Remove(tmp)
+	if err := os.Chmod(tempPath, 0400); err != nil {
+		_ = os.Remove(tempPath)
 		return fmt.Errorf("debuginfod: cache commit %s: %w", e.key, err)
 	}
-	if err := os.Rename(tmp, e.finalPath); err != nil {
-		_ = os.Remove(tmp)
+	if err := os.Rename(tempPath, e.finalPath); err != nil {
+		_ = os.Remove(tempPath)
 		return fmt.Errorf("debuginfod: cache commit %s: %w", e.key, err)
 	}
 	e.committed = true
@@ -185,65 +183,65 @@ func (e *diskCacheEntry) Close() error {
 	if e.committed {
 		return nil
 	}
-	tmp := e.f.Name()
-	_ = e.f.Close()
-	_ = os.Remove(tmp)
+	tempPath := e.file.Name()
+	_ = e.file.Close()
+	_ = os.Remove(tempPath)
 	return nil
 }
 
-func (c *DiskCache) Delete(_ context.Context, k Key) error {
-	p, err := c.path(k)
+func (c *DiskCache) Delete(_ context.Context, key Key) error {
+	path, err := c.path(key)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("debuginfod: cache delete %s: %w", k, err)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("debuginfod: cache delete %s: %w", key, err)
 	}
 	return nil
 }
 
-func (c *DiskCache) path(k Key) (string, error) {
-	if k.BuildID == "" {
+func (c *DiskCache) path(key Key) (string, error) {
+	if key.BuildID == "" {
 		return "", fmt.Errorf("debuginfod: cache key has empty BuildID")
 	}
-	switch k.Kind {
+	switch key.Kind {
 	case KindDebugInfo, KindExecutable:
-		if k.Qualifier != "" {
-			return "", fmt.Errorf("debuginfod: cache key %s has unexpected qualifier", k)
+		if key.Qualifier != "" {
+			return "", fmt.Errorf("debuginfod: cache key %s has unexpected qualifier", key)
 		}
-		return filepath.Join(c.dir, k.BuildID, k.Kind.String()), nil
+		return filepath.Join(c.dir, key.BuildID, key.Kind.String()), nil
 	case KindSection:
-		if k.Qualifier == "" {
-			return "", fmt.Errorf("debuginfod: cache key %s requires qualifier", k)
+		if key.Qualifier == "" {
+			return "", fmt.Errorf("debuginfod: cache key %s requires qualifier", key)
 		}
-		return filepath.Join(c.dir, k.BuildID, k.Kind.String(), url.PathEscape(k.Qualifier)), nil
+		return filepath.Join(c.dir, key.BuildID, key.Kind.String(), url.PathEscape(key.Qualifier)), nil
 	case KindSource:
-		if k.Qualifier == "" {
-			return "", fmt.Errorf("debuginfod: cache key %s requires qualifier", k)
+		if key.Qualifier == "" {
+			return "", fmt.Errorf("debuginfod: cache key %s requires qualifier", key)
 		}
-		segs, err := sourcePathSegments(k.Qualifier)
+		segments, err := sourcePathSegments(key.Qualifier)
 		if err != nil {
-			return "", fmt.Errorf("debuginfod: cache key %s: %w", k, err)
+			return "", fmt.Errorf("debuginfod: cache key %s: %w", key, err)
 		}
-		return filepath.Join(append([]string{c.dir, k.BuildID, k.Kind.String()}, segs...)...), nil
+		return filepath.Join(append([]string{c.dir, key.BuildID, key.Kind.String()}, segments...)...), nil
 	}
-	return "", fmt.Errorf("debuginfod: cache key %s has unknown kind", k)
+	return "", fmt.Errorf("debuginfod: cache key %s has unknown kind", key)
 }
 
 // sourcePathSegments URL-escapes each path segment and rejects "." / ".." segments.
-func sourcePathSegments(p string) ([]string, error) {
-	var out []string
-	for _, seg := range strings.Split(p, "/") {
-		if seg == "" {
+func sourcePathSegments(path string) ([]string, error) {
+	var escaped []string
+	for _, segment := range strings.Split(path, "/") {
+		if segment == "" {
 			continue
 		}
-		if seg == "." || seg == ".." {
-			return nil, fmt.Errorf("invalid path segment %q", seg)
+		if segment == "." || segment == ".." {
+			return nil, fmt.Errorf("invalid path segment %q", segment)
 		}
-		out = append(out, url.PathEscape(seg))
+		escaped = append(escaped, url.PathEscape(segment))
 	}
-	if len(out) == 0 {
+	if len(escaped) == 0 {
 		return nil, fmt.Errorf("path is empty")
 	}
-	return out, nil
+	return escaped, nil
 }

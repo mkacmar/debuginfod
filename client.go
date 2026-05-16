@@ -32,7 +32,6 @@ type Client struct {
 	logger     *slog.Logger
 }
 
-// Options configures a Client.
 type Options struct {
 	// ServerURLs is the list of debuginfod server base URLs to query.
 	// All servers are queried in parallel.
@@ -50,7 +49,6 @@ type Options struct {
 	Logger *slog.Logger
 }
 
-// HTTPOptions configures the HTTP client behavior for debuginfod requests.
 type HTTPOptions struct {
 	// Client is the HTTP client used for debuginfod requests.
 	// If nil, a client with a cloned http.DefaultTransport is used.
@@ -125,26 +123,26 @@ func normalizeServerURLs(urls []string) ([]string, error) {
 	seen := make(map[string]bool, len(urls))
 	out := make([]string, 0, len(urls))
 	for _, raw := range urls {
-		u, err := url.Parse(raw)
+		parsed, err := url.Parse(raw)
 		if err != nil {
 			return nil, fmt.Errorf("debuginfod: invalid server URL %q: %w", raw, err)
 		}
-		scheme := strings.ToLower(u.Scheme)
+		scheme := strings.ToLower(parsed.Scheme)
 		if scheme != "http" && scheme != "https" {
 			return nil, fmt.Errorf("debuginfod: server URL %q must use http or https", raw)
 		}
-		if u.Host == "" {
+		if parsed.Host == "" {
 			return nil, fmt.Errorf("debuginfod: server URL %q has no host", raw)
 		}
-		u.Scheme = scheme
-		u.Host = strings.ToLower(u.Host)
-		u.Path = strings.TrimRight(u.Path, "/")
-		n := u.String()
-		if seen[n] {
+		parsed.Scheme = scheme
+		parsed.Host = strings.ToLower(parsed.Host)
+		parsed.Path = strings.TrimRight(parsed.Path, "/")
+		normalized := parsed.String()
+		if seen[normalized] {
 			continue
 		}
-		seen[n] = true
-		out = append(out, n)
+		seen[normalized] = true
+		out = append(out, normalized)
 	}
 	return out, nil
 }
@@ -156,16 +154,15 @@ func validateBuildID(buildID string) (string, error) {
 	if len(buildID)%2 != 0 {
 		return "", fmt.Errorf("debuginfod: build ID has odd length: %q", buildID)
 	}
-	for _, c := range buildID {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-			return "", fmt.Errorf("debuginfod: build ID contains invalid character: %q", c)
+	for _, ch := range buildID {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+			return "", fmt.Errorf("debuginfod: build ID contains invalid character: %q", ch)
 		}
 	}
 	return strings.ToLower(buildID), nil
 }
 
 // FetchDebugInfo fetches the debug info file for the given build ID.
-// Returns an io.ReadCloser the caller must close.
 func (c *Client) FetchDebugInfo(ctx context.Context, buildID string) (io.ReadCloser, error) {
 	id, err := validateBuildID(buildID)
 	if err != nil {
@@ -227,7 +224,6 @@ func (c *Client) FetchSection(ctx context.Context, buildID string, sectionName s
 	}
 
 	// Server doesn't support the section endpoint, or it doesn't have this section.
-	// Fetch the full debuginfo and slice the section from it.
 	c.logger.Debug("section endpoint unavailable, falling back to full debuginfo",
 		slog.String("buildID", id),
 		slog.String("section", sectionName),
@@ -244,27 +240,27 @@ func (c *Client) fetchSectionViaDebugInfo(ctx context.Context, buildID, sectionN
 	}
 	defer debugRC.Close()
 
-	ra, ok := debugRC.(io.ReaderAt)
+	debugInfo, ok := debugRC.(io.ReaderAt)
 	if !ok {
 		data, err := io.ReadAll(debugRC)
 		if err != nil {
 			return nil, fmt.Errorf("debuginfod: read debuginfo for section %q: %w", sectionName, err)
 		}
-		ra = bytes.NewReader(data)
+		debugInfo = bytes.NewReader(data)
 	}
 
-	elfFile, err := elf.NewFile(ra)
+	elfFile, err := elf.NewFile(debugInfo)
 	if err != nil {
 		return nil, fmt.Errorf("debuginfod: parse debuginfo for section %q: %w", sectionName, err)
 	}
 	defer elfFile.Close()
 
-	sec := elfFile.Section(sectionName)
-	if sec == nil {
+	section := elfFile.Section(sectionName)
+	if section == nil {
 		return nil, ErrNotFound
 	}
 
-	sectionData, err := io.ReadAll(sec.Open())
+	sectionData, err := io.ReadAll(section.Open())
 	if err != nil {
 		return nil, fmt.Errorf("debuginfod: read section %q: %w", sectionName, err)
 	}
@@ -291,87 +287,19 @@ func (c *Client) fetchSectionViaDebugInfo(ctx context.Context, buildID, sectionN
 // A nil return for both values means the caller should go to the network.
 func (c *Client) tryLocalSection(ctx context.Context, buildID, sectionName string) (io.ReadCloser, error) {
 	sectionKey := Key{BuildID: buildID, Kind: KindSection, Qualifier: sectionName}
-	rc, err := c.cache.Get(ctx, sectionKey)
-	if err == nil {
-		c.logger.Debug("section cache hit", slog.String("buildID", buildID), slog.String("section", sectionName))
+	if rc, ok := c.tryCachedSection(ctx, sectionKey, buildID, sectionName); ok {
 		return rc, nil
 	}
-	if !errors.Is(err, ErrNotFound) {
-		c.logger.Warn("section cache get failed",
-			slog.String("buildID", buildID),
-			slog.String("section", sectionName),
-			slog.Any("error", err),
-		)
-	}
 
-	debugKey := Key{BuildID: buildID, Kind: KindDebugInfo}
-	debugRC, err := c.cache.Get(ctx, debugKey)
-	if err != nil {
-		if !errors.Is(err, ErrNotFound) {
-			c.logger.Warn("debuginfo cache get failed",
-				slog.String("buildID", buildID),
-				slog.Any("error", err),
-			)
-		}
-		return nil, nil
-	}
-	defer debugRC.Close()
-
-	ra, ok := debugRC.(io.ReaderAt)
+	cachedDebugInfo, ok := c.loadCachedDebugInfoReaderAt(ctx, buildID)
 	if !ok {
-		c.logger.Debug("cached debuginfo not seekable, buffering for local slice",
-			slog.String("buildID", buildID),
-		)
-		data, err := io.ReadAll(debugRC)
-		if err != nil {
-			c.logger.Warn("cached debuginfo read failed",
-				slog.String("buildID", buildID),
-				slog.Any("error", err),
-			)
-			return nil, nil
-		}
-		ra = bytes.NewReader(data)
-	}
-
-	elfFile, err := elf.NewFile(ra)
-	if err != nil {
-		c.logger.Warn("cached debuginfo not parseable as ELF, evicting",
-			slog.String("buildID", buildID),
-			slog.Any("error", err),
-		)
-		if err := c.cache.Delete(ctx, debugKey); err != nil {
-			c.logger.Warn("debuginfo cache delete failed",
-				slog.String("buildID", buildID),
-				slog.Any("error", err),
-			)
-		}
 		return nil, nil
 	}
-	defer elfFile.Close()
+	defer cachedDebugInfo.Close()
 
-	sec := elfFile.Section(sectionName)
-	if sec == nil {
-		c.logger.Debug("section not in cached debuginfo",
-			slog.String("buildID", buildID),
-			slog.String("section", sectionName),
-		)
-		return nil, ErrNotFound
-	}
-
-	data, err := io.ReadAll(sec.Open())
-	if err != nil {
-		c.logger.Warn("cached debuginfo section read failed, evicting",
-			slog.String("buildID", buildID),
-			slog.String("section", sectionName),
-			slog.Any("error", err),
-		)
-		if err := c.cache.Delete(ctx, debugKey); err != nil {
-			c.logger.Warn("debuginfo cache delete failed",
-				slog.String("buildID", buildID),
-				slog.Any("error", err),
-			)
-		}
-		return nil, fmt.Errorf("debuginfod: read section %q from cached debuginfo: %w", sectionName, err)
+	data, err := c.sliceSectionFromCachedDebugInfo(ctx, cachedDebugInfo, buildID, sectionName)
+	if err != nil || data == nil {
+		return nil, err
 	}
 
 	if err := putReader(ctx, c.cache, sectionKey, bytes.NewReader(data)); err != nil {
@@ -381,12 +309,121 @@ func (c *Client) tryLocalSection(ctx context.Context, buildID, sectionName strin
 			slog.Any("error", err),
 		)
 	}
-
 	c.logger.Debug("section sliced from cached debuginfo",
 		slog.String("buildID", buildID),
 		slog.String("section", sectionName),
 	)
 	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// tryCachedSection returns a cached section reader on cache hit.
+// On cache miss or read error it logs and returns ok=false, so the caller falls back to slicing.
+func (c *Client) tryCachedSection(ctx context.Context, key Key, buildID, sectionName string) (io.ReadCloser, bool) {
+	rc, err := c.cache.Get(ctx, key)
+	if err == nil {
+		c.logger.Debug("section cache hit", slog.String("buildID", buildID), slog.String("section", sectionName))
+		return rc, true
+	}
+	if !errors.Is(err, ErrNotFound) {
+		c.logger.Warn("section cache get failed",
+			slog.String("buildID", buildID),
+			slog.String("section", sectionName),
+			slog.Any("error", err),
+		)
+	}
+	return nil, false
+}
+
+// readerAtCloser pairs an io.ReaderAt with the Close method of the underlying source.
+// It lets loadCachedDebugInfoReaderAt return a single value whether the source is seekable or had to be buffered in memory.
+type readerAtCloser struct {
+	io.ReaderAt
+	io.Closer
+}
+
+// loadCachedDebugInfoReaderAt fetches cached debuginfo and exposes it as an io.ReaderAt.
+// If the cached reader is not itself an io.ReaderAt, the contents are buffered in memory.
+// The caller must Close the returned value when done.
+// Returns ok=false on cache miss, read error, or buffering failure.
+func (c *Client) loadCachedDebugInfoReaderAt(ctx context.Context, buildID string) (readerAtCloser, bool) {
+	debugKey := Key{BuildID: buildID, Kind: KindDebugInfo}
+	debugRC, err := c.cache.Get(ctx, debugKey)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			c.logger.Warn("debuginfo cache get failed",
+				slog.String("buildID", buildID),
+				slog.Any("error", err),
+			)
+		}
+		return readerAtCloser{}, false
+	}
+
+	if readerAt, ok := debugRC.(io.ReaderAt); ok {
+		return readerAtCloser{ReaderAt: readerAt, Closer: debugRC}, true
+	}
+
+	c.logger.Debug("cached debuginfo not seekable, buffering for local slice",
+		slog.String("buildID", buildID),
+	)
+	data, err := io.ReadAll(debugRC)
+	if err != nil {
+		_ = debugRC.Close()
+		c.logger.Warn("cached debuginfo read failed",
+			slog.String("buildID", buildID),
+			slog.Any("error", err),
+		)
+		return readerAtCloser{}, false
+	}
+	return readerAtCloser{ReaderAt: bytes.NewReader(data), Closer: debugRC}, true
+}
+
+// sliceSectionFromCachedDebugInfo parses debugInfo as ELF and returns the bytes of the named section.
+// Returns (nil, nil) when the cached debuginfo is corrupt, in which case it is evicted before returning so the caller falls back to the network.
+// Returns (nil, ErrNotFound) when the ELF parses but does not contain the section.
+// Returns (nil, err) when the section is present but cannot be read, in which case the cached debuginfo is also evicted.
+func (c *Client) sliceSectionFromCachedDebugInfo(ctx context.Context, debugInfo io.ReaderAt, buildID, sectionName string) ([]byte, error) {
+	debugKey := Key{BuildID: buildID, Kind: KindDebugInfo}
+
+	elfFile, err := elf.NewFile(debugInfo)
+	if err != nil {
+		c.logger.Warn("cached debuginfo not parseable as ELF, evicting",
+			slog.String("buildID", buildID),
+			slog.Any("error", err),
+		)
+		c.evictDebugInfo(ctx, debugKey, buildID)
+		return nil, nil
+	}
+	defer elfFile.Close()
+
+	section := elfFile.Section(sectionName)
+	if section == nil {
+		c.logger.Debug("section not in cached debuginfo",
+			slog.String("buildID", buildID),
+			slog.String("section", sectionName),
+		)
+		return nil, ErrNotFound
+	}
+
+	data, err := io.ReadAll(section.Open())
+	if err != nil {
+		c.logger.Warn("cached debuginfo section read failed, evicting",
+			slog.String("buildID", buildID),
+			slog.String("section", sectionName),
+			slog.Any("error", err),
+		)
+		c.evictDebugInfo(ctx, debugKey, buildID)
+		return nil, fmt.Errorf("debuginfod: read section %q from cached debuginfo: %w", sectionName, err)
+	}
+	return data, nil
+}
+
+func (c *Client) evictDebugInfo(ctx context.Context, key Key, buildID string) {
+	if err := c.cache.Delete(ctx, key); err != nil {
+		c.logger.Warn("debuginfo cache delete failed",
+			slog.String("buildID", buildID),
+			slog.Any("error", err),
+		)
+	}
 }
 
 // ExponentialBackoff returns a backoff function using the "Full Jitter" algorithm.
@@ -412,10 +449,10 @@ func ExponentialBackoff(baseDelay, maxDelay time.Duration) (func(retry int) time
 }
 
 // urlEscapeSourcePath URL-escapes each "/"-separated segment, preserving the separators.
-func urlEscapeSourcePath(p string) string {
-	parts := strings.Split(p, "/")
-	for i, s := range parts {
-		parts[i] = url.PathEscape(s)
+func urlEscapeSourcePath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, segment := range parts {
+		parts[i] = url.PathEscape(segment)
 	}
 	return strings.Join(parts, "/")
 }
@@ -452,14 +489,14 @@ func (c *Client) fetch(ctx context.Context, key Key, urlPath string) (io.ReadClo
 // On clean EOF the entry is committed.
 // On any error or early caller Close the entry is discarded.
 func (c *Client) streamThroughCache(key Key, body io.ReadCloser, entry CacheEntry) io.ReadCloser {
-	pr, pw := io.Pipe()
+	pipeReader, pipeWriter := io.Pipe()
 
 	go func() {
-		_, copyErr := io.Copy(io.MultiWriter(entry, pw), body)
+		_, copyErr := io.Copy(io.MultiWriter(entry, pipeWriter), body)
 		_ = body.Close()
 		if copyErr != nil {
 			_ = entry.Close()
-			_ = pw.CloseWithError(copyErr)
+			_ = pipeWriter.CloseWithError(copyErr)
 			c.logger.Debug("cache stream aborted", slog.String("key", key.String()), slog.Any("error", copyErr))
 			return
 		}
@@ -469,26 +506,26 @@ func (c *Client) streamThroughCache(key Key, body io.ReadCloser, entry CacheEntr
 			c.logger.Debug("cached artifact", slog.String("key", key.String()))
 		}
 		_ = entry.Close()
-		_ = pw.Close()
+		_ = pipeWriter.Close()
 	}()
 
-	return &cacheStreamReader{pr: pr, body: body}
+	return &cacheStreamReader{pipe: pipeReader, body: body}
 }
 
 // cacheStreamReader is the caller's view of a fetch that is being teed into a cache entry.
 // Closing it before EOF unblocks the copy goroutine, which then discards the staged entry.
 type cacheStreamReader struct {
-	pr   *io.PipeReader
+	pipe *io.PipeReader
 	body io.Closer
 }
 
 func (r *cacheStreamReader) Read(p []byte) (int, error) {
-	return r.pr.Read(p)
+	return r.pipe.Read(p)
 }
 
 func (r *cacheStreamReader) Close() error {
 	_ = r.body.Close()
-	return r.pr.Close()
+	return r.pipe.Close()
 }
 
 // fetchFromServers queries the configured servers in parallel.
@@ -528,36 +565,36 @@ type serverResult struct {
 
 // fanout starts one goroutine per configured server, returning the first 200 response and aborting the rest.
 func (c *Client) fanout(ctx context.Context, urlPath string) (io.ReadCloser, error) {
-	n := len(c.serverURLs)
-	cancels := make([]context.CancelFunc, n)
-	ch := make(chan serverResult, n)
+	serverCount := len(c.serverURLs)
+	cancels := make([]context.CancelFunc, serverCount)
+	results := make(chan serverResult, serverCount)
 
-	for i, s := range c.serverURLs {
+	for i, serverURL := range c.serverURLs {
 		serverCtx, cancel := context.WithCancel(ctx) // #nosec G118 -- cancel is stored in cancels[i] and invoked via drainLosers or the all-error cleanup loop below
 		cancels[i] = cancel
-		go func(i int, s string, ctx context.Context) {
-			rc, responded, err := c.fetchFromServer(ctx, s, urlPath)
-			ch <- serverResult{i, rc, err, responded}
-		}(i, s, serverCtx)
+		go func(i int, serverURL string, ctx context.Context) {
+			body, responded, err := c.fetchFromServer(ctx, serverURL, urlPath)
+			results <- serverResult{i, body, err, responded}
+		}(i, serverURL, serverCtx)
 	}
 
 	var errs []error
 	responded := false
-	for i := 0; i < n; i++ {
-		r := <-ch
-		server := c.serverURLs[r.idx]
-		if r.body != nil {
+	for i := 0; i < serverCount; i++ {
+		result := <-results
+		server := c.serverURLs[result.idx]
+		if result.body != nil {
 			c.logger.Debug("fetched from server", slog.String("server", server), slog.String("path", urlPath))
-			go drainLosers(ch, cancels, r.idx, n-i-1)
-			return &cancelOnClose{ReadCloser: r.body, cancel: cancels[r.idx]}, nil
+			go drainLosers(results, cancels, result.idx, serverCount-i-1)
+			return &cancelOnClose{ReadCloser: result.body, cancel: cancels[result.idx]}, nil
 		}
-		if r.responded {
+		if result.responded {
 			responded = true
-			c.logger.Debug("server reports artifact absent", slog.String("server", server), slog.Any("error", r.err))
+			c.logger.Debug("server reports artifact absent", slog.String("server", server), slog.Any("error", result.err))
 		} else {
-			c.logger.Debug("server unreachable", slog.String("server", server), slog.Any("error", r.err))
+			c.logger.Debug("server unreachable", slog.String("server", server), slog.Any("error", result.err))
 		}
-		errs = append(errs, r.err)
+		errs = append(errs, result.err)
 	}
 	for _, cancel := range cancels {
 		cancel()
@@ -568,16 +605,16 @@ func (c *Client) fanout(ctx context.Context, urlPath string) (io.ReadCloser, err
 	return nil, errors.Join(errs...)
 }
 
-func drainLosers(ch <-chan serverResult, cancels []context.CancelFunc, winner, remaining int) {
+func drainLosers(results <-chan serverResult, cancels []context.CancelFunc, winner, remaining int) {
 	for i, cancel := range cancels {
 		if i != winner {
 			cancel()
 		}
 	}
 	for i := 0; i < remaining; i++ {
-		r := <-ch
-		if r.body != nil {
-			_ = r.body.Close()
+		result := <-results
+		if result.body != nil {
+			_ = result.body.Close()
 		}
 	}
 }

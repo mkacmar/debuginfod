@@ -33,17 +33,17 @@ func TestExponentialBackoff_ValidBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if d := backoff(0); d != 0 {
-		t.Errorf("backoff(0) = %s, want 0", d)
+	if delay := backoff(0); delay != 0 {
+		t.Errorf("backoff(0) = %s, want 0", delay)
 	}
-	if d := backoff(-1); d != 0 {
-		t.Errorf("backoff(-1) = %s, want 0", d)
+	if delay := backoff(-1); delay != 0 {
+		t.Errorf("backoff(-1) = %s, want 0", delay)
 	}
 
 	for retry := 1; retry <= 10; retry++ {
-		d := backoff(retry)
-		if d < 0 || d > maxDelay {
-			t.Errorf("backoff(%d) = %s, out of [0, %s]", retry, d, maxDelay)
+		delay := backoff(retry)
+		if delay < 0 || delay > maxDelay {
+			t.Errorf("backoff(%d) = %s, out of [0, %s]", retry, delay, maxDelay)
 		}
 	}
 }
