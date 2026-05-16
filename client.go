@@ -148,18 +148,11 @@ func normalizeServerURLs(urls []string) ([]string, error) {
 }
 
 func validateBuildID(buildID string) (string, error) {
-	if buildID == "" {
-		return "", fmt.Errorf("debuginfod: build ID is empty")
+	lowered := strings.ToLower(buildID)
+	if err := (Key{BuildID: lowered, Kind: KindDebugInfo}).validate(); err != nil {
+		return "", err
 	}
-	if len(buildID)%2 != 0 {
-		return "", fmt.Errorf("debuginfod: build ID has odd length: %q", buildID)
-	}
-	for _, ch := range buildID {
-		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
-			return "", fmt.Errorf("debuginfod: build ID contains invalid character: %q", ch)
-		}
-	}
-	return strings.ToLower(buildID), nil
+	return lowered, nil
 }
 
 // FetchDebugInfo fetches the debug info file for the given build ID.

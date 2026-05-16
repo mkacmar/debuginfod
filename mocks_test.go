@@ -8,6 +8,8 @@ import (
 	"sync"
 )
 
+const testBuildID = "aabbccdd"
+
 type memCache struct {
 	mu   sync.Mutex
 	data map[Key][]byte

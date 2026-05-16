@@ -4,9 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -49,6 +46,45 @@ func (k Key) String() string {
 	return fmt.Sprintf("%s/%s/%s", k.BuildID, k.Kind, k.Qualifier)
 }
 
+// validate reports whether k is well-formed for use as a cache key.
+// Concrete Cache implementations should validate before computing storage locations.
+func (k Key) validate() error {
+	if k.BuildID == "" {
+		return fmt.Errorf("debuginfod: cache key has empty BuildID")
+	}
+	if len(k.BuildID)%2 != 0 {
+		return fmt.Errorf("debuginfod: cache key has odd-length BuildID: %q", k.BuildID)
+	}
+	for _, ch := range k.BuildID {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+			return fmt.Errorf("debuginfod: cache key has non-hex character in BuildID: %q", ch)
+		}
+	}
+	switch k.Kind {
+	case KindDebugInfo, KindExecutable:
+		if k.Qualifier != "" {
+			return fmt.Errorf("debuginfod: cache key %s has unexpected qualifier", k)
+		}
+	case KindSource:
+		if k.Qualifier == "" {
+			return fmt.Errorf("debuginfod: cache key %s requires qualifier", k)
+		}
+	case KindSection:
+		if k.Qualifier == "" {
+			return fmt.Errorf("debuginfod: cache key %s requires qualifier", k)
+		}
+		if k.Qualifier == "." || k.Qualifier == ".." {
+			return fmt.Errorf("debuginfod: cache key %s has invalid section name", k)
+		}
+		if strings.ContainsAny(k.Qualifier, "/\x00") {
+			return fmt.Errorf("debuginfod: cache key %s has invalid section name", k)
+		}
+	default:
+		return fmt.Errorf("debuginfod: cache key %s has unknown kind", k)
+	}
+	return nil
+}
+
 // Cache is the interface for artifact storage backends.
 // Implementations must be safe for concurrent use.
 type Cache interface {
@@ -77,10 +113,10 @@ type CacheEntry interface {
 	Commit() error
 }
 
-// putReader stores all bytes from reader under key.
+// putReader stores all bytes from reader under k.
 // It runs the full Create-Copy-Commit-Close lifecycle and aborts on any error.
-func putReader(ctx context.Context, cache Cache, key Key, reader io.Reader) error {
-	entry, err := cache.Create(ctx, key)
+func putReader(ctx context.Context, cache Cache, k Key, reader io.Reader) error {
+	entry, err := cache.Create(ctx, k)
 	if err != nil {
 		return err
 	}
@@ -89,159 +125,4 @@ func putReader(ctx context.Context, cache Cache, key Key, reader io.Reader) erro
 		return err
 	}
 	return entry.Commit()
-}
-
-type DiskCacheOptions struct {
-	// Dir is the root directory for cached artifacts.
-	Dir string
-}
-
-// DiskCache is a file-system-backed Cache implementation.
-// Layout: <dir>/<buildID>/{debuginfo,executable,section/<escaped-name>,source/<escaped-path>}
-type DiskCache struct {
-	dir string
-}
-
-func NewDiskCache(opts DiskCacheOptions) (*DiskCache, error) {
-	if opts.Dir == "" {
-		return nil, fmt.Errorf("debuginfod: cache directory is required")
-	}
-	if err := os.MkdirAll(opts.Dir, 0750); err != nil {
-		return nil, fmt.Errorf("debuginfod: failed to create cache directory: %w", err)
-	}
-	return &DiskCache{dir: opts.Dir}, nil
-}
-
-func (c *DiskCache) Get(_ context.Context, key Key) (io.ReadCloser, error) {
-	path, err := c.path(key)
-	if err != nil {
-		return nil, err
-	}
-	file, err := os.Open(path) // #nosec G304 -- path derived from configured cache directory
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNotFound
-		}
-		return nil, fmt.Errorf("debuginfod: cache get %s: %w", key, err)
-	}
-	return file, nil
-}
-
-func (c *DiskCache) Create(_ context.Context, key Key) (CacheEntry, error) {
-	path, err := c.path(key)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
-		return nil, fmt.Errorf("debuginfod: cache create %s: %w", key, err)
-	}
-	file, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return nil, fmt.Errorf("debuginfod: cache create %s: %w", key, err)
-	}
-	return &diskCacheEntry{file: file, finalPath: path, key: key}, nil
-}
-
-// diskCacheEntry stages bytes in a temp file and atomically renames to the final path on Commit.
-type diskCacheEntry struct {
-	file      *os.File
-	finalPath string
-	key       Key
-	committed bool
-	closed    bool
-}
-
-func (e *diskCacheEntry) Write(p []byte) (int, error) {
-	return e.file.Write(p)
-}
-
-func (e *diskCacheEntry) Commit() error {
-	if e.committed {
-		return ErrAlreadyCommitted
-	}
-	tempPath := e.file.Name()
-	if err := e.file.Close(); err != nil {
-		return fmt.Errorf("debuginfod: cache commit %s: %w", e.key, err)
-	}
-	if err := os.Chmod(tempPath, 0400); err != nil {
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("debuginfod: cache commit %s: %w", e.key, err)
-	}
-	if err := os.Rename(tempPath, e.finalPath); err != nil {
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("debuginfod: cache commit %s: %w", e.key, err)
-	}
-	e.committed = true
-	return nil
-}
-
-func (e *diskCacheEntry) Close() error {
-	if e.closed {
-		return nil
-	}
-	e.closed = true
-	if e.committed {
-		return nil
-	}
-	tempPath := e.file.Name()
-	_ = e.file.Close()
-	_ = os.Remove(tempPath)
-	return nil
-}
-
-func (c *DiskCache) Delete(_ context.Context, key Key) error {
-	path, err := c.path(key)
-	if err != nil {
-		return err
-	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("debuginfod: cache delete %s: %w", key, err)
-	}
-	return nil
-}
-
-func (c *DiskCache) path(key Key) (string, error) {
-	if key.BuildID == "" {
-		return "", fmt.Errorf("debuginfod: cache key has empty BuildID")
-	}
-	switch key.Kind {
-	case KindDebugInfo, KindExecutable:
-		if key.Qualifier != "" {
-			return "", fmt.Errorf("debuginfod: cache key %s has unexpected qualifier", key)
-		}
-		return filepath.Join(c.dir, key.BuildID, key.Kind.String()), nil
-	case KindSection:
-		if key.Qualifier == "" {
-			return "", fmt.Errorf("debuginfod: cache key %s requires qualifier", key)
-		}
-		return filepath.Join(c.dir, key.BuildID, key.Kind.String(), url.PathEscape(key.Qualifier)), nil
-	case KindSource:
-		if key.Qualifier == "" {
-			return "", fmt.Errorf("debuginfod: cache key %s requires qualifier", key)
-		}
-		segments, err := sourcePathSegments(key.Qualifier)
-		if err != nil {
-			return "", fmt.Errorf("debuginfod: cache key %s: %w", key, err)
-		}
-		return filepath.Join(append([]string{c.dir, key.BuildID, key.Kind.String()}, segments...)...), nil
-	}
-	return "", fmt.Errorf("debuginfod: cache key %s has unknown kind", key)
-}
-
-// sourcePathSegments URL-escapes each path segment and rejects "." / ".." segments.
-func sourcePathSegments(path string) ([]string, error) {
-	var escaped []string
-	for _, segment := range strings.Split(path, "/") {
-		if segment == "" {
-			continue
-		}
-		if segment == "." || segment == ".." {
-			return nil, fmt.Errorf("invalid path segment %q", segment)
-		}
-		escaped = append(escaped, url.PathEscape(segment))
-	}
-	if len(escaped) == 0 {
-		return nil, fmt.Errorf("path is empty")
-	}
-	return escaped, nil
 }

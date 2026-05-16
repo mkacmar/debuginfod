@@ -14,8 +14,6 @@ import (
 	"testing"
 )
 
-const testBuildID = "aabbccdd"
-
 func TestClient_FetchSection_FallsBackToFullDebugInfo(t *testing.T) {
 	const sectionName = ".text"
 	sectionContent := []byte("section payload")

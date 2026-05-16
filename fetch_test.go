@@ -162,3 +162,30 @@ func TestClient_FetchEscapesSpecialChars(t *testing.T) {
 		})
 	}
 }
+
+func TestClient_FetchWithoutCache(t *testing.T) {
+	body := "streamed data"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+
+	client, err := NewClient(Options{ServerURLs: []string{srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rc, err := client.FetchDebugInfo(context.Background(), testBuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body {
+		t.Errorf("got %q, want %q", got, body)
+	}
+}
