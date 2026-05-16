@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -35,7 +36,7 @@ func TestClient_FastestServerWins(t *testing.T) {
 	}
 
 	start := time.Now()
-	rc, err := client.FetchDebugInfo(context.Background(), "aabbccdd")
+	rc, err := client.FetchDebugInfo(context.Background(), testBuildID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +73,7 @@ func TestClient_PrefersBodyOverNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rc, err := client.FetchDebugInfo(context.Background(), "aabbccdd")
+	rc, err := client.FetchDebugInfo(context.Background(), testBuildID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +109,7 @@ func TestClient_LosingServerRequestIsCancelled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rc, err := client.FetchDebugInfo(context.Background(), "aabbccdd")
+	rc, err := client.FetchDebugInfo(context.Background(), testBuildID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +123,59 @@ func TestClient_LosingServerRequestIsCancelled(t *testing.T) {
 	}
 }
 
+func TestClient_NotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client, err := NewClient(Options{
+		ServerURLs: []string{srv.URL},
+		HTTP:       HTTPOptions{MaxRetries: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.FetchDebugInfo(context.Background(), testBuildID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got %v", err)
+	}
+}
+
+// Only network failures should retry. HTTP responses are authoritative.
+func TestClient_AnyHTTPResponseIsNotFound(t *testing.T) {
+	for _, code := range []int{400, 401, 403, 405, 410, 500, 501, 503} {
+		t.Run(fmt.Sprintf("status_%d", code), func(t *testing.T) {
+			var requestCount atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestCount.Add(1)
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+
+			client, err := NewClient(Options{
+				ServerURLs: []string{srv.URL},
+				HTTP: HTTPOptions{
+					MaxRetries: 2,
+					Backoff:    func(retry int) time.Duration { return time.Millisecond },
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = client.FetchDebugInfo(context.Background(), testBuildID)
+			if !errors.Is(err, ErrNotFound) {
+				t.Fatalf("expected ErrNotFound, got %v", err)
+			}
+			if got := requestCount.Load(); got != 1 {
+				t.Errorf("expected 1 request (no retry on HTTP response), got %d", got)
+			}
+		})
+	}
+}
+
 // A 404 from one server is authoritative and prevents retrying an unreachable peer.
 func TestClient_NotFoundShortCircuitsRetry(t *testing.T) {
 	notFoundSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -129,12 +183,8 @@ func TestClient_NotFoundShortCircuitsRetry(t *testing.T) {
 	}))
 	defer notFoundSrv.Close()
 
-	unreachableSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	unreachableURL := unreachableSrv.URL
-	unreachableSrv.Close()
-
 	client, err := NewClient(Options{
-		ServerURLs: []string{notFoundSrv.URL, unreachableURL},
+		ServerURLs: []string{notFoundSrv.URL, unreachableURL(t)},
 		HTTP: HTTPOptions{
 			MaxRetries: 2,
 			Backoff:    func(retry int) time.Duration { return time.Millisecond },
@@ -144,20 +194,10 @@ func TestClient_NotFoundShortCircuitsRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = client.FetchDebugInfo(context.Background(), "aabbccdd")
+	_, err = client.FetchDebugInfo(context.Background(), testBuildID)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound (one server gave a definitive 404), got %v", err)
 	}
-}
-
-// unreachableURL returns a URL to a server that has been closed.
-// Any TCP dial against it fails immediately, exercising the retry path.
-func unreachableURL(t *testing.T) string {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	url := srv.URL
-	srv.Close()
-	return url
 }
 
 func TestClient_RetryLoop_ExhaustsMaxRetriesAndRecordsBackoff(t *testing.T) {
@@ -229,4 +269,34 @@ func TestClient_RetryLoop_HonorsContextCancelDuringBackoff(t *testing.T) {
 	if elapsed > time.Second {
 		t.Errorf("cancel took %s; expected sub-second return", elapsed)
 	}
+}
+
+func TestClient_ContextCancellationDuringRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	client, err := NewClient(Options{ServerURLs: []string{srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err = client.FetchDebugInfo(ctx, testBuildID)
+	if err == nil {
+		t.Error("expected error from cancelled context")
+	}
+}
+
+// unreachableURL returns a URL to a server that has been closed.
+// Any TCP dial against it fails immediately, exercising the retry path.
+func unreachableURL(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+	return url
 }
