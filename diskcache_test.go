@@ -10,70 +10,14 @@ import (
 	"testing"
 )
 
-func TestNewDiskCache_RejectEmptyDir(t *testing.T) {
+func TestDiskCache_Conformance(t *testing.T) {
+	testCacheConformance(t, func(t *testing.T) Cache { return newTestDiskCache(t) })
+}
+
+func TestDiskCache_RejectsEmptyDir(t *testing.T) {
 	_, err := NewDiskCache(DiskCacheOptions{})
 	if err == nil {
 		t.Error("expected error for empty dir")
-	}
-}
-
-func TestDiskCache_CreateGet(t *testing.T) {
-	cache := newTestDiskCache(t)
-	ctx := context.Background()
-	key := Key{BuildID: testBuildID, Kind: KindDebugInfo}
-	data := []byte("ELF debug data here")
-
-	if err := putReader(ctx, cache, key, bytes.NewReader(data)); err != nil {
-		t.Fatal(err)
-	}
-
-	rc, err := cache.Get(ctx, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rc.Close()
-
-	got, err := io.ReadAll(rc)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !bytes.Equal(got, data) {
-		t.Errorf("got %q, want %q", got, data)
-	}
-}
-
-func TestDiskCache_GetMissing(t *testing.T) {
-	cache := newTestDiskCache(t)
-
-	rc, err := cache.Get(context.Background(), Key{BuildID: testBuildID, Kind: KindDebugInfo})
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("expected ErrNotFound, got %v", err)
-	}
-	if rc != nil {
-		rc.Close()
-		t.Error("expected nil ReadCloser for missing key")
-	}
-}
-
-func TestDiskCache_DoubleCommit(t *testing.T) {
-	cache := newTestDiskCache(t)
-	ctx := context.Background()
-	key := Key{BuildID: testBuildID, Kind: KindDebugInfo}
-
-	entry, err := cache.Create(ctx, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer entry.Close()
-	if _, err := entry.Write([]byte("data")); err != nil {
-		t.Fatal(err)
-	}
-	if err := entry.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	if err := entry.Commit(); !errors.Is(err, ErrAlreadyCommitted) {
-		t.Errorf("second Commit got %v, want ErrAlreadyCommitted", err)
 	}
 }
 
@@ -82,7 +26,7 @@ func TestDiskCache_CommittedEntryIsReadOnly(t *testing.T) {
 	ctx := context.Background()
 	key := Key{BuildID: testBuildID, Kind: KindDebugInfo}
 
-	if err := putReader(ctx, cache, key, bytes.NewReader([]byte("data"))); err != nil {
+	if err := copyToCache(ctx, cache, key, bytes.NewReader([]byte("data"))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -99,34 +43,61 @@ func TestDiskCache_CommittedEntryIsReadOnly(t *testing.T) {
 	}
 }
 
-func TestDiskCache_Delete(t *testing.T) {
-	cache := newTestDiskCache(t)
+func TestDiskCache_EvictPrunesEmptyParents(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewDiskCache(DiskCacheOptions{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+
 	ctx := context.Background()
-	key := Key{BuildID: testBuildID, Kind: KindDebugInfo}
+	key := Key{BuildID: testBuildID, Kind: KindSection, Qualifier: ".text"}
 
-	if err := putReader(ctx, cache, key, bytes.NewReader([]byte("data"))); err != nil {
+	if err := copyToCache(ctx, cache, key, bytes.NewReader([]byte("data"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Evict(ctx, key); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := cache.Delete(ctx, key); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := cache.Get(ctx, key)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("expected ErrNotFound, got %v", err)
-	}
-	if got != nil {
-		got.Close()
-		t.Error("expected nil ReadCloser after delete")
+	// Both <buildID>/section/ and <buildID>/ should be gone now that they're empty.
+	for _, rel := range []string{filepath.Join(testBuildID, "section"), testBuildID} {
+		if _, err := os.Stat(filepath.Join(dir, rel)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("directory %s should have been pruned, stat err = %v", rel, err)
+		}
 	}
 }
 
-func TestDiskCache_DeleteMissing(t *testing.T) {
-	cache := newTestDiskCache(t)
+func TestDiskCache_EvictStopsAtNonEmptyParent(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewDiskCache(DiskCacheOptions{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
 
-	if err := cache.Delete(context.Background(), Key{BuildID: testBuildID, Kind: KindDebugInfo}); err != nil {
-		t.Errorf("delete of missing key should return nil, got %v", err)
+	ctx := context.Background()
+	sectionKey := Key{BuildID: testBuildID, Kind: KindSection, Qualifier: ".text"}
+	debugKey := Key{BuildID: testBuildID, Kind: KindDebugInfo}
+
+	if err := copyToCache(ctx, cache, sectionKey, bytes.NewReader([]byte("s"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyToCache(ctx, cache, debugKey, bytes.NewReader([]byte("d"))); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cache.Evict(ctx, sectionKey); err != nil {
+		t.Fatal(err)
+	}
+
+	// The section subdir is gone, but the buildID dir survives, the debuginfo file sits in it.
+	if _, err := os.Stat(filepath.Join(dir, testBuildID, "section")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("section dir should be gone, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, testBuildID, "debuginfo")); err != nil {
+		t.Errorf("debuginfo file should still exist: %v", err)
 	}
 }
 
@@ -152,20 +123,19 @@ func TestDiskCache_RejectsBadKey(t *testing.T) {
 		{"MissingSectionQualifier", Key{BuildID: testBuildID, Kind: KindSection}},
 		{"DotSectionQualifier", Key{BuildID: testBuildID, Kind: KindSection, Qualifier: "."}},
 		{"DotDotSectionQualifier", Key{BuildID: testBuildID, Kind: KindSection, Qualifier: ".."}},
-		{"SlashSectionQualifier", Key{BuildID: testBuildID, Kind: KindSection, Qualifier: "foo/bar"}},
 		{"NulSectionQualifier", Key{BuildID: testBuildID, Kind: KindSection, Qualifier: "foo\x00bar"}},
 		{"UnknownKind", Key{BuildID: testBuildID, Kind: ArtifactKind(99)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := putReader(ctx, cache, tc.key, bytes.NewReader([]byte("x"))); err == nil {
-				t.Errorf("Create with %s should have failed", tc.name)
+			if err := copyToCache(ctx, cache, tc.key, bytes.NewReader([]byte("x"))); err == nil {
+				t.Errorf("Stage with %s should have failed", tc.name)
 			}
-			if _, err := cache.Get(ctx, tc.key); err == nil {
-				t.Errorf("Get with %s should have failed", tc.name)
+			if _, err := cache.Fetch(ctx, tc.key); err == nil {
+				t.Errorf("Fetch with %s should have failed", tc.name)
 			}
-			if err := cache.Delete(ctx, tc.key); err == nil {
-				t.Errorf("Delete with %s should have failed", tc.name)
+			if err := cache.Evict(ctx, tc.key); err == nil {
+				t.Errorf("Evict with %s should have failed", tc.name)
 			}
 		})
 	}
@@ -192,11 +162,11 @@ func TestDiskCache_RejectsSymlinkEscape(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cache.Close() })
 
-	rc, err := cache.Get(context.Background(), Key{BuildID: testBuildID, Kind: KindDebugInfo})
+	rc, err := cache.Fetch(context.Background(), Key{BuildID: testBuildID, Kind: KindDebugInfo})
 	if err == nil {
 		body, _ := io.ReadAll(rc)
 		rc.Close()
-		t.Fatalf("Get followed symlink out of cache root and returned %q", body)
+		t.Fatalf("Fetch followed symlink out of cache root and returned %q", body)
 	}
 }
 

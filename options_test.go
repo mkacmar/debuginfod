@@ -9,13 +9,13 @@ import (
 	"testing"
 )
 
-func TestNewClient_NoServers(t *testing.T) {
+func TestClient_RequiresServers(t *testing.T) {
 	if _, err := NewClient(Options{}); err == nil {
 		t.Error("expected error for no server URLs")
 	}
 }
 
-func TestNewClient_NormalizesServerURLs(t *testing.T) {
+func TestClient_NormalizesServerURLs(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -23,14 +23,11 @@ func TestNewClient_NormalizesServerURLs(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := NewClient(Options{
+	client := mustNewClient(t, Options{
 		ServerURLs: []string{srv.URL, srv.URL + "/", srv.URL},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	_, _ = client.FetchDebugInfo(context.Background(), "aabbccdd")
+	_, _ = client.FetchDebugInfo(context.Background(), testBuildID)
 
 	if got := hits.Load(); got != 1 {
 		t.Errorf("expected 1 request after URL normalization, got %d", got)
@@ -97,7 +94,7 @@ func TestClient_UserAgent(t *testing.T) {
 		want      string
 	}{
 		{"custom", "myapp/1.0", "myapp/1.0"},
-		{"default", "", defaultUserAgent},
+		{"default", "", defaultUserAgent()},
 	}
 
 	for _, tc := range cases {
@@ -109,20 +106,17 @@ func TestClient_UserAgent(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			client, err := NewClient(Options{
+			client := mustNewClient(t, Options{
 				ServerURLs: []string{srv.URL},
-				Cache:      newMemCache(),
+				Cache:      NewMemoryCache(),
 				HTTP:       HTTPOptions{UserAgent: tc.userAgent},
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
 
-			rc, err := client.FetchDebugInfo(context.Background(), "aabbccdd")
+			rc, err := client.FetchDebugInfo(context.Background(), testBuildID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			rc.Close()
+			readAndClose(t, rc)
 
 			if gotUA != tc.want {
 				t.Errorf("User-Agent = %q, want %q", gotUA, tc.want)

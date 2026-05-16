@@ -1,14 +1,13 @@
-// Package debuginfod is a client for debuginfod federations.
+// Package debuginfod is a client for the debuginfod protocol.
 //
 // debuginfod is an HTTP service that distributes ELF debug artifacts keyed by GNU build ID.
 // See https://sourceware.org/elfutils/Debuginfod.html for the protocol.
 //
-// Client queries every configured server in parallel and returns the first success.
-// Network failures retry with exponential backoff.
-// Any HTTP response is authoritative and short-circuits the retry loop.
+// Client queries one or more upstream debuginfod servers, optionally backed by a Cache.
+// When a Cache is configured, it is consulted first, upstream servers are queried in parallel on miss,
+// and successful responses are written through to the cache.
+// The library is transport-only and does not parse artifacts.
 //
-// An optional Cache stores fetched artifacts.
-// The provided DiskCache lays artifacts out per build ID so section requests can be sliced from cached debuginfo without going to the network.
-//
-// Client is safe for concurrent use.
+// Cache is the extension point for storage backends.
+// DiskCache and MemoryCache are provided as ready-to-use implementations.
 package debuginfod

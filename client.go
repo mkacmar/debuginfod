@@ -2,31 +2,43 @@ package debuginfod
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	defaultUserAgent = "debuginfod-go"
+	modulePath = "go.kacmar.sk/debuginfod"
 )
 
-// Client is a debuginfod HTTP client with retries and exponential backoff.
+var defaultUserAgent = sync.OnceValue(func() string {
+	version := "unknown"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Path == modulePath {
+			version = info.Main.Version
+		} else {
+			for _, dep := range info.Deps {
+				if dep.Path == modulePath {
+					version = dep.Version
+					break
+				}
+			}
+		}
+	}
+	return modulePath + "/" + version
+})
+
+// Client is a debuginfod client.
 //
+// A Client queries one or more upstream debuginfod servers, optionally backed by a cache.
 // A Client is safe for concurrent use.
 type Client struct {
-	serverURLs []string
-	cache      Cache
-	httpClient *http.Client
-	maxRetries int
-	backoff    func(round int) time.Duration
-	userAgent  string
-	logger     *slog.Logger
+	source source
 }
 
 type Options struct {
@@ -77,7 +89,11 @@ func NewClient(opts Options) (*Client, error) {
 
 	httpClient := opts.HTTP.Client
 	if httpClient == nil {
-		httpClient = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+		transport := http.DefaultTransport
+		if t, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport = t.Clone()
+		}
+		httpClient = &http.Client{Transport: transport}
 	}
 
 	maxRetries := opts.HTTP.MaxRetries
@@ -87,8 +103,7 @@ func NewClient(opts Options) (*Client, error) {
 
 	backoff := opts.HTTP.Backoff
 	if backoff == nil {
-		var err error
-		backoff, err = ExponentialBackoff(1*time.Second, 30*time.Second)
+		backoff, err = ExponentialBackoff(defaultBaseBackoff, defaultMaxBackoff)
 		if err != nil {
 			return nil, err
 		}
@@ -96,7 +111,7 @@ func NewClient(opts Options) (*Client, error) {
 
 	userAgent := opts.HTTP.UserAgent
 	if userAgent == "" {
-		userAgent = defaultUserAgent
+		userAgent = defaultUserAgent()
 	}
 
 	logger := opts.Logger
@@ -104,167 +119,50 @@ func NewClient(opts Options) (*Client, error) {
 		logger = slog.New(slog.DiscardHandler)
 	}
 
-	return &Client{
-		serverURLs: serverURLs,
-		cache:      opts.Cache,
-		httpClient: httpClient,
-		maxRetries: maxRetries,
-		backoff:    backoff,
-		userAgent:  userAgent,
-		logger:     logger,
-	}, nil
-}
-
-// normalizeServerURLs validates and canonicalizes server URLs, removing duplicates.
-func normalizeServerURLs(urls []string) ([]string, error) {
-	seen := make(map[string]bool, len(urls))
-	out := make([]string, 0, len(urls))
-	for _, raw := range urls {
-		parsed, err := url.Parse(raw)
-		if err != nil {
-			return nil, fmt.Errorf("debuginfod: invalid server URL %q: %w", raw, err)
+	servers := make([]source, len(serverURLs))
+	for i, serverURL := range serverURLs {
+		servers[i] = &httpSource{
+			serverURL:  serverURL,
+			httpClient: httpClient,
+			userAgent:  userAgent,
 		}
-		scheme := strings.ToLower(parsed.Scheme)
-		if scheme != "http" && scheme != "https" {
-			return nil, fmt.Errorf("debuginfod: server URL %q must use http or https", raw)
-		}
-		if parsed.Host == "" {
-			return nil, fmt.Errorf("debuginfod: server URL %q has no host", raw)
-		}
-		parsed.Scheme = scheme
-		parsed.Host = strings.ToLower(parsed.Host)
-		parsed.Path = strings.TrimRight(parsed.Path, "/")
-		normalized := parsed.String()
-		if seen[normalized] {
-			continue
-		}
-		seen[normalized] = true
-		out = append(out, normalized)
 	}
-	return out, nil
-}
 
-func validateBuildID(buildID string) (string, error) {
-	lowered := strings.ToLower(buildID)
-	if err := (Key{BuildID: lowered, Kind: KindDebugInfo}).validate(); err != nil {
-		return "", err
+	network := newRetrying(newAuthoritativeRace(servers, logger), maxRetries, backoff, logger)
+	var pipeline source
+	if opts.Cache != nil {
+		pipeline = newChain([]source{opts.Cache, newTeeing(network, opts.Cache, logger)}, logger)
+	} else {
+		pipeline = network
 	}
-	return lowered, nil
+
+	return &Client{source: pipeline}, nil
 }
 
-// FetchDebugInfo fetches the debug info file for the given build ID.
+func (c *Client) fetch(ctx context.Context, key Key) (io.ReadCloser, error) {
+	key.BuildID = strings.ToLower(key.BuildID)
+	if err := key.Validate(); err != nil {
+		return nil, err
+	}
+	return c.source.Fetch(ctx, key)
+}
+
+// FetchDebugInfo fetches the debug info file for buildID.
 func (c *Client) FetchDebugInfo(ctx context.Context, buildID string) (io.ReadCloser, error) {
-	id, err := validateBuildID(buildID)
-	if err != nil {
-		return nil, err
-	}
-	return c.fetch(ctx, Key{BuildID: id, Kind: KindDebugInfo}, id+"/debuginfo")
+	return c.fetch(ctx, Key{BuildID: buildID, Kind: KindDebugInfo})
 }
 
-// FetchExecutable fetches the executable for the given build ID.
+// FetchExecutable fetches the executable for buildID.
 func (c *Client) FetchExecutable(ctx context.Context, buildID string) (io.ReadCloser, error) {
-	id, err := validateBuildID(buildID)
-	if err != nil {
-		return nil, err
-	}
-	return c.fetch(ctx, Key{BuildID: id, Kind: KindExecutable}, id+"/executable")
+	return c.fetch(ctx, Key{BuildID: buildID, Kind: KindExecutable})
 }
 
-// FetchSource fetches a source file for the given build ID and absolute source path.
+// FetchSource fetches a source file for buildID identified by its absolute sourcePath.
 func (c *Client) FetchSource(ctx context.Context, buildID string, sourcePath string) (io.ReadCloser, error) {
-	id, err := validateBuildID(buildID)
-	if err != nil {
-		return nil, err
-	}
-	if sourcePath == "" {
-		return nil, fmt.Errorf("debuginfod: source path is empty")
-	}
-	if !strings.HasPrefix(sourcePath, "/") {
-		return nil, fmt.Errorf("debuginfod: source path must be absolute (start with /): %q", sourcePath)
-	}
-	key := Key{BuildID: id, Kind: KindSource, Qualifier: sourcePath}
-	return c.fetch(ctx, key, id+"/source"+urlEscapeSourcePath(sourcePath))
+	return c.fetch(ctx, Key{BuildID: buildID, Kind: KindSource, Qualifier: sourcePath})
 }
 
-// FetchSection fetches a specific ELF section for the given build ID.
-// If the server doesn't support the /section/ endpoint, falls back to fetching the full debuginfo and slicing the section from it.
-
-// urlEscapeSourcePath URL-escapes each "/"-separated segment, preserving the separators.
-func urlEscapeSourcePath(path string) string {
-	parts := strings.Split(path, "/")
-	for i, segment := range parts {
-		parts[i] = url.PathEscape(segment)
-	}
-	return strings.Join(parts, "/")
-}
-
-func (c *Client) fetch(ctx context.Context, key Key, urlPath string) (io.ReadCloser, error) {
-	if c.cache == nil {
-		return c.fetchFromServers(ctx, urlPath)
-	}
-
-	rc, err := c.cache.Get(ctx, key)
-	if err == nil {
-		c.logger.Debug("cache hit", slog.String("key", key.String()))
-		return rc, nil
-	}
-	if !errors.Is(err, ErrNotFound) {
-		c.logger.Warn("cache get failed", slog.String("key", key.String()), slog.Any("error", err))
-	}
-
-	body, err := c.fetchFromServers(ctx, urlPath)
-	if err != nil {
-		return nil, err
-	}
-
-	entry, err := c.cache.Create(ctx, key)
-	if err != nil {
-		c.logger.Warn("cache create failed", slog.String("key", key.String()), slog.Any("error", err))
-		return body, nil
-	}
-
-	return c.streamThroughCache(key, body, entry), nil
-}
-
-// streamThroughCache fans bytes from body into both the cache entry and the caller's reader.
-// On clean EOF the entry is committed.
-// On any error or early caller Close the entry is discarded.
-func (c *Client) streamThroughCache(key Key, body io.ReadCloser, entry CacheEntry) io.ReadCloser {
-	pipeReader, pipeWriter := io.Pipe()
-
-	go func() {
-		_, copyErr := io.Copy(io.MultiWriter(entry, pipeWriter), body)
-		_ = body.Close()
-		if copyErr != nil {
-			_ = entry.Close()
-			_ = pipeWriter.CloseWithError(copyErr)
-			c.logger.Debug("cache stream aborted", slog.String("key", key.String()), slog.Any("error", copyErr))
-			return
-		}
-		if cerr := entry.Commit(); cerr != nil {
-			c.logger.Warn("cache commit failed", slog.String("key", key.String()), slog.Any("error", cerr))
-		} else {
-			c.logger.Debug("cached artifact", slog.String("key", key.String()))
-		}
-		_ = entry.Close()
-		_ = pipeWriter.Close()
-	}()
-
-	return &cacheStreamReader{pipe: pipeReader, body: body}
-}
-
-// cacheStreamReader is the caller's view of a fetch that is being teed into a cache entry.
-// Closing it before EOF unblocks the copy goroutine, which then discards the staged entry.
-type cacheStreamReader struct {
-	pipe *io.PipeReader
-	body io.Closer
-}
-
-func (r *cacheStreamReader) Read(p []byte) (int, error) {
-	return r.pipe.Read(p)
-}
-
-func (r *cacheStreamReader) Close() error {
-	_ = r.body.Close()
-	return r.pipe.Close()
+// FetchSection fetches sectionName for buildID.
+func (c *Client) FetchSection(ctx context.Context, buildID string, sectionName string) (io.ReadCloser, error) {
+	return c.fetch(ctx, Key{BuildID: buildID, Kind: KindSection, Qualifier: sectionName})
 }

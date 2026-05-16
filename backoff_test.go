@@ -1,6 +1,7 @@
 package debuginfod
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -37,30 +38,41 @@ func TestExponentialBackoff_NonPositiveRetryReturnsZero(t *testing.T) {
 	}
 }
 
-func TestExponentialBackoff_DelayStaysWithinMaxDelay(t *testing.T) {
-	baseDelay := 100 * time.Millisecond
-	maxDelay := time.Second
-	backoff, err := ExponentialBackoff(baseDelay, maxDelay)
-	if err != nil {
-		t.Fatal(err)
+func TestExponentialBackoff_DelayWithinBounds(t *testing.T) {
+	cases := []struct {
+		name      string
+		baseDelay time.Duration
+		maxDelay  time.Duration
+		retries   []int
+	}{
+		{"normal", 100 * time.Millisecond, time.Second, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}},
+		{"extremeBoundsNoOverflow", time.Nanosecond, time.Duration(1 << 62), []int{100, 1000, 1 << 30}},
 	}
-	for retry := 1; retry <= 10; retry++ {
-		delay := backoff(retry)
-		if delay < 0 || delay > maxDelay {
-			t.Errorf("backoff(%d) = %s, out of [0, %s]", retry, delay, maxDelay)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backoff, err := ExponentialBackoff(tc.baseDelay, tc.maxDelay)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, retry := range tc.retries {
+				delay := backoff(retry)
+				if delay < 0 || delay > tc.maxDelay {
+					t.Errorf("backoff(%d) = %s, out of [0, %s]", retry, delay, tc.maxDelay)
+				}
+			}
+		})
 	}
 }
 
-func TestExponentialBackoff_LargeRetryDoesNotOverflow(t *testing.T) {
-	backoff, err := ExponentialBackoff(time.Nanosecond, time.Duration(1<<62))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, retry := range []int{100, 1000, 1 << 30} {
-		delay := backoff(retry)
-		if delay < 0 {
-			t.Errorf("backoff(%d) = %s, want non-negative", retry, delay)
-		}
+func TestExponentialBackoff_DoesNotHangOnExtremeMaxDelay(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		_, _ = ExponentialBackoff(time.Nanosecond, time.Duration(math.MaxInt64))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ExponentialBackoff hung, likely overflow in the maxShift loop")
 	}
 }
