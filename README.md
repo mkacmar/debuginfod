@@ -96,40 +96,6 @@ The library never silently escalates a section request into a full debuginfo dow
 
 If you want a section and the upstream cannot serve it, fetch the full debuginfo and extract the section locally with [`debug/elf`](https://pkg.go.dev/debug/elf).
 
-```go
-func fetchSection(ctx context.Context, c *debuginfod.Client, buildID, name string) ([]byte, error) {
-    rc, err := c.FetchSection(ctx, buildID, name)
-    if err == nil {
-        defer rc.Close()
-        return io.ReadAll(rc)
-    }
-    if !errors.Is(err, debuginfod.ErrNotFound) {
-        return nil, err
-    }
-
-    // /section unavailable, fall back to the full debuginfo and slice locally.
-    rc, err = c.FetchDebugInfo(ctx, buildID)
-    if err != nil {
-        return nil, err
-    }
-    defer rc.Close()
-    raw, err := io.ReadAll(rc)
-    if err != nil {
-        return nil, err
-    }
-    f, err := elf.NewFile(bytes.NewReader(raw))
-    if err != nil {
-        return nil, err
-    }
-    defer f.Close()
-    s := f.Section(name)
-    if s == nil {
-        return nil, debuginfod.ErrNotFound
-    }
-    return io.ReadAll(s.Open())
-}
-```
-
 ### Retries
 
 Each retry round fans out across all configured servers in parallel. Any HTTP response from any server is authoritative and ends the round, so only network failures trigger another round.
