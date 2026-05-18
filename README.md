@@ -83,7 +83,7 @@ client, err := debuginfod.NewClient(debuginfod.Options{
 
 The returned `ReadCloser` streams bytes as they arrive from upstream and writes them into the cache. Closing it before `EOF` aborts the in-flight cache write so partial responses do not poison the cache.
 
-[`Cache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Cache) is an interface. Callers can plug in alternative storage backends (e.g. shared blob store, ring buffer, content-addressed object store) by implementing `Fetch`, `Stage`, and `Evict`. The same pipeline (parallel fan-out, retries, write-through) applies regardless of the backend.
+[`Cache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Cache) is an interface. Callers can plug in alternative storage backends (e.g. shared blob store, ring buffer, content-addressed object store) by implementing `Fetch`, `Stage`, and `Evict`. `Stage` returns a [`CacheEntry`](https://pkg.go.dev/go.kacmar.sk/debuginfod#CacheEntry) the library writes to and `Commit`s once the upstream response finishes. See [`MemoryCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#MemoryCache) for a minimal reference implementation. The same pipeline (parallel fan-out, retries, write-through) applies regardless of the backend.
 
 ### Section requests
 
