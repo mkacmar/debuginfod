@@ -91,10 +91,8 @@ See [`MemoryCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#MemoryCache) for 
 
 ### Section requests
 
-`FetchSection` calls the upstream `/section` endpoint and returns its response. 
-
-Not every debuginfod server implements `/section`. When the endpoint is unavailable, `FetchSection` returns `ErrNotFound` and the client does not attempt any further action on its own.
-The library never silently escalates a section request into a full debuginfo download. This is a policy decision left to the caller.
+`FetchSection` calls the upstream `/section` endpoint and returns its response. Not every debuginfod server implements `/section`, in which case `FetchSection` returns `ErrNotFound` and the client does not attempt any further action on its own.
+The library never silently escalates a section request into a full debuginfo download, which is a policy decision left to the caller.
 
 If you want a section and the upstream cannot serve it, fetch the full debuginfo and extract the section locally with [`debug/elf`](https://pkg.go.dev/debug/elf).
 
@@ -134,7 +132,7 @@ func fetchSection(ctx context.Context, c *debuginfod.Client, buildID, name strin
 
 ### Retries
 
-Each retry round fans out across all configured servers in parallel. Only network failures trigger retries. Any HTTP response from any server is authoritative and ends the round.
+Each retry round fans out across all configured servers in parallel. Any HTTP response from any server is authoritative and ends the round, so only network failures trigger another round.
 
 A cache miss requires every configured server to respond, since one server's 404 is not authoritative for the federation. Total latency on a miss is therefore bounded by the slowest server, not the fastest.
 
@@ -159,7 +157,7 @@ When `Backoff` is unset, the library uses [`ExponentialBackoff`](https://pkg.go.
 
 ### Authentication and custom headers
 
-For private debuginfod instances, inject a custom `http.RoundTripper` via `HTTPOptions.Client` and decorate outbound requests with auth scheme you need. Per-host routing is straightforward via `req.URL.Host`. The same hook covers bearer tokens, basic auth, and mTLS (`Transport.TLSClientConfig`).
+For private debuginfod instances, inject a custom `http.RoundTripper` via `HTTPOptions.Client` and decorate outbound requests with the auth scheme you need (per-host routing via `req.URL.Host`). The same hook covers bearer tokens, basic auth, and mTLS (`Transport.TLSClientConfig`).
 
 For shared or public servers, set `HTTPOptions.UserAgent` to identify your client to debuginfod operators.
 
@@ -176,7 +174,7 @@ client, err := debuginfod.NewClient(debuginfod.Options{
 
 ### Timeouts
 
-The library does not impose timeouts of its own. 
+The library does not impose timeouts of its own.
 
 Two knobs cover the common cases:
 
