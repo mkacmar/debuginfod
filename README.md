@@ -37,7 +37,8 @@ if err != nil {
 defer rc.Close()
 ```
 
-All options besides `ServerURLs` are optional. See [`Options`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Options) for the full list of fields.
+All options besides `ServerURLs` are optional.
+See [`Options`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Options) for the full list of fields.
 
 [`Client`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Client) is safe for concurrent use.
 
@@ -83,11 +84,17 @@ client, err := debuginfod.NewClient(debuginfod.Options{
 
 The returned `ReadCloser` streams bytes as they arrive from upstream and writes them into the cache. Closing it before `EOF` aborts the in-flight cache write so partial responses do not poison the cache.
 
-[`Cache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Cache) is an interface. Callers can plug in alternative storage backends (e.g. shared blob store, ring buffer, content-addressed object store) by implementing `Fetch`, `Stage`, and `Evict`. `Stage` returns a [`CacheEntry`](https://pkg.go.dev/go.kacmar.sk/debuginfod#CacheEntry) the library writes to and `Commit`s once the upstream response finishes. See [`MemoryCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#MemoryCache) for a minimal reference implementation. The same pipeline (parallel fan-out, retries, write-through) applies regardless of the backend.
+[`Cache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Cache) is an interface. Callers can plug in alternative storage backends (e.g. shared blob store, ring buffer, content-addressed object store) by implementing `Fetch`, `Stage`, and `Evict`.
+`Stage` returns a [`CacheEntry`](https://pkg.go.dev/go.kacmar.sk/debuginfod#CacheEntry) the library writes to and `Commit`s once the upstream response finishes.
+
+See [`MemoryCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#MemoryCache) for a minimal reference implementation.
 
 ### Section requests
 
-`FetchSection` calls the upstream `/section` endpoint and returns its response. Not every debuginfod server implements `/section`. When the endpoint is unavailable, `FetchSection` returns `ErrNotFound` and the client does not attempt any further action on its own. The library never silently escalates a section request into a full debuginfo download. This is a policy decision left to the caller.
+`FetchSection` calls the upstream `/section` endpoint and returns its response. 
+
+Not every debuginfod server implements `/section`. When the endpoint is unavailable, `FetchSection` returns `ErrNotFound` and the client does not attempt any further action on its own.
+The library never silently escalates a section request into a full debuginfo download. This is a policy decision left to the caller.
 
 If you want a section and the upstream cannot serve it, fetch the full debuginfo and extract the section locally with [`debug/elf`](https://pkg.go.dev/debug/elf).
 
@@ -129,7 +136,9 @@ func fetchSection(ctx context.Context, c *debuginfod.Client, buildID, name strin
 
 Each retry round fans out across all configured servers in parallel. Only network failures trigger retries. Any HTTP response from any server is authoritative and ends the round.
 
-A cache miss requires every configured server to respond, since one server's 404 is not authoritative for the federation. Total latency on a miss is therefore bounded by the slowest server, not the fastest. Use a context deadline or a per-attempt HTTP transport timeout to cap this (see [Timeouts](#timeouts)).
+A cache miss requires every configured server to respond, since one server's 404 is not authoritative for the federation. Total latency on a miss is therefore bounded by the slowest server, not the fastest.
+
+Use a context deadline or a per-attempt HTTP transport timeout to cap this (see [Timeouts](#timeouts)).
 
 ```go
 backoff, err := debuginfod.ExponentialBackoff(2*time.Second, 60*time.Second)
@@ -167,7 +176,9 @@ client, err := debuginfod.NewClient(debuginfod.Options{
 
 ### Timeouts
 
-The library does not impose timeouts of its own. Two knobs cover the common cases:
+The library does not impose timeouts of its own. 
+
+Two knobs cover the common cases:
 
 - **Total budget** across all servers and retries: set a deadline on the `context.Context` passed to `Fetch*` methods. On a cache miss, this budget covers the slowest server, not the fastest (see [Retries](#retries)).
 - **Per-attempt budget**: configure your own `*http.Client` via `HTTPOptions.Client` and use `http.Client.Timeout`, `Transport.ResponseHeaderTimeout`, or a custom `net.Dialer.Timeout` (wired through `Transport.DialContext`) to bound how long any single server request may stall.
