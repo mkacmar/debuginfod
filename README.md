@@ -1,5 +1,9 @@
 # debuginfod
 
+[![CI](https://github.com/mkacmar/debuginfod/actions/workflows/ci.yml/badge.svg)](https://github.com/mkacmar/debuginfod/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/go.kacmar.sk/debuginfod.svg)](https://pkg.go.dev/go.kacmar.sk/debuginfod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 > **Note**: This is a v0 release, API may change.
 
 A Go client library for [debuginfod](https://sourceware.org/elfutils/Debuginfod.html) servers.
