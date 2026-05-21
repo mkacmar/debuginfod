@@ -7,21 +7,23 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"go.kacmar.sk/debuginfod/key"
 )
 
-func newTestHTTPSource(serverURL string) *httpSource {
-	return &httpSource{
+func newTestUpstream(serverURL string) *upstream {
+	return &upstream{
 		serverURL:  serverURL,
 		httpClient: http.DefaultClient,
 		userAgent:  "test-agent",
 	}
 }
 
-func TestHTTPSource_SuccessReturnsBody(t *testing.T) {
+func TestUpstream_SuccessReturnsBody(t *testing.T) {
 	body := "the bytes"
 	srv := staticServer(t, body)
 
-	src := newTestHTTPSource(srv.URL)
+	src := newTestUpstream(srv.URL)
 	rc, err := src.Fetch(context.Background(), testKey)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -31,41 +33,7 @@ func TestHTTPSource_SuccessReturnsBody(t *testing.T) {
 	}
 }
 
-func TestHTTPSource_BuildsRequestPathFromKey(t *testing.T) {
-	cases := []struct {
-		name string
-		key  Key
-		want string
-	}{
-		{"DebugInfo", Key{BuildID: testBuildID, Kind: KindDebugInfo}, "/buildid/" + testBuildID + "/debuginfo"},
-		{"Executable", Key{BuildID: testBuildID, Kind: KindExecutable}, "/buildid/" + testBuildID + "/executable"},
-		{"Source", Key{BuildID: testBuildID, Kind: KindSource, Qualifier: "/usr/src/main.c"}, "/buildid/" + testBuildID + "/source/usr/src/main.c"},
-		{"Section", Key{BuildID: testBuildID, Kind: KindSection, Qualifier: ".text"}, "/buildid/" + testBuildID + "/section/.text"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var gotPath string
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				gotPath = r.URL.Path
-				fmt.Fprint(w, "ok")
-			}))
-			defer srv.Close()
-
-			src := newTestHTTPSource(srv.URL)
-			rc, err := src.Fetch(context.Background(), tc.key)
-			if err != nil {
-				t.Fatalf("Fetch: %v", err)
-			}
-			rc.Close()
-
-			if gotPath != tc.want {
-				t.Errorf("request path = %q, want %q", gotPath, tc.want)
-			}
-		})
-	}
-}
-
-func TestHTTPSource_SendsUserAgent(t *testing.T) {
+func TestUpstream_SendsUserAgent(t *testing.T) {
 	var gotUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUA = r.Header.Get("User-Agent")
@@ -73,7 +41,7 @@ func TestHTTPSource_SendsUserAgent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	src := &httpSource{serverURL: srv.URL, httpClient: http.DefaultClient, userAgent: "my-agent/1.0"}
+	src := &upstream{serverURL: srv.URL, httpClient: http.DefaultClient, userAgent: "my-agent/1.0"}
 	rc, err := src.Fetch(context.Background(), testKey)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -85,9 +53,9 @@ func TestHTTPSource_SendsUserAgent(t *testing.T) {
 	}
 }
 
-// TestHTTPSource_StatusMapping asserts how httpSource translates upstream status codes into errors.
+// TestUpstream_StatusMapping asserts how upstream translates upstream status codes into errors.
 // 401/403 produce ErrAuthRequired, other 4xx produce ErrNotFound, 5xx/429 produce transport errors that engage the retry layer.
-func TestHTTPSource_StatusMapping(t *testing.T) {
+func TestUpstream_StatusMapping(t *testing.T) {
 	cases := []struct {
 		name      string
 		code      int
@@ -114,7 +82,7 @@ func TestHTTPSource_StatusMapping(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			src := newTestHTTPSource(srv.URL)
+			src := newTestUpstream(srv.URL)
 			_, err := src.Fetch(context.Background(), testKey)
 			if err == nil {
 				t.Fatalf("status %d: expected error", tc.code)
@@ -129,8 +97,8 @@ func TestHTTPSource_StatusMapping(t *testing.T) {
 	}
 }
 
-func TestHTTPSource_NetworkErrorIsNotErrNotFound(t *testing.T) {
-	src := newTestHTTPSource(unreachableURL(t))
+func TestUpstream_NetworkErrorIsNotErrNotFound(t *testing.T) {
+	src := newTestUpstream(unreachableURL(t))
 	_, err := src.Fetch(context.Background(), testKey)
 	if err == nil {
 		t.Fatal("expected error from unreachable server")
@@ -140,7 +108,7 @@ func TestHTTPSource_NetworkErrorIsNotErrNotFound(t *testing.T) {
 	}
 }
 
-func TestHTTPSource_PropagatesContextCancellation(t *testing.T) {
+func TestUpstream_PropagatesContextCancellation(t *testing.T) {
 	started := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
@@ -149,7 +117,7 @@ func TestHTTPSource_PropagatesContextCancellation(t *testing.T) {
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	src := newTestHTTPSource(srv.URL)
+	src := newTestUpstream(srv.URL)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -173,4 +141,28 @@ func unreachableURL(t *testing.T) string {
 	url := srv.URL
 	srv.Close()
 	return url
+}
+
+func TestBuildURLPath(t *testing.T) {
+	cases := []struct {
+		name string
+		key  key.Key
+		want string
+	}{
+		{"DebugInfo", key.DebugInfo(testBuildID), "/buildid/" + testBuildID + "/debuginfo"},
+		{"Executable", key.Executable(testBuildID), "/buildid/" + testBuildID + "/executable"},
+		{"Source", key.Source(testBuildID, "/usr/src/main.c"), "/buildid/" + testBuildID + "/source/usr/src/main.c"},
+		{"SourcePreservesSlashes", key.Source(testBuildID, "/a/b/c.c"), "/buildid/" + testBuildID + "/source/a/b/c.c"},
+		{"SourceEscapesSegment", key.Source(testBuildID, "/dir with space/x.c"), "/buildid/" + testBuildID + "/source/dir%20with%20space/x.c"},
+		{"SourceEscapesPercent", key.Source(testBuildID, "/a/100%foo.c"), "/buildid/" + testBuildID + "/source/a/100%25foo.c"},
+		{"Section", key.Section(testBuildID, ".text"), "/buildid/" + testBuildID + "/section/.text"},
+		{"SectionEscapesSlash", key.Section(testBuildID, ".rela/.text"), "/buildid/" + testBuildID + "/section/.rela%2F.text"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildURLPath(tc.key); got != tc.want {
+				t.Errorf("buildURLPath() = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

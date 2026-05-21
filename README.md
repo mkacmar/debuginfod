@@ -8,7 +8,7 @@
 
 A Go client library for [debuginfod](https://sourceware.org/elfutils/Debuginfod.html) servers.
 
-Queries every configured server in parallel and returns the first authoritative response. Optionally caches artifacts on disk or in memory.
+Queries every configured server in parallel and returns the first authoritative response. An optional companion package provides on-disk caching.
 
 See [API documentation](https://pkg.go.dev/go.kacmar.sk/debuginfod) for details.
 
@@ -23,6 +23,11 @@ Requires Go 1.25 or later.
 ## Usage
 
 ```go
+import (
+    "go.kacmar.sk/debuginfod"
+    "go.kacmar.sk/debuginfod/key"
+)
+
 client, err := debuginfod.NewClient(debuginfod.Options{
     ServerURLs: []string{"https://debuginfod.elfutils.org"},
 })
@@ -30,19 +35,14 @@ if err != nil {
     return err
 }
 
-rc, err := client.FetchDebugInfo(ctx, buildID)
+rc, err := client.Fetch(ctx, key.DebugInfo(buildID))
 if err != nil {
     return err
 }
 defer rc.Close()
 ```
 
-All options besides `ServerURLs` are optional.
-See [`Options`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Options) for the full list of fields.
-
-[`Client`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Client) is safe for concurrent use.
-
-Four artifact-specific methods are provided: [`FetchDebugInfo`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Client.FetchDebugInfo), [`FetchExecutable`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Client.FetchExecutable), [`FetchSource`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Client.FetchSource), and [`FetchSection`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Client.FetchSection).
+The [`key`](https://pkg.go.dev/go.kacmar.sk/debuginfod/key) package exposes constructors for the four artifact kinds: `DebugInfo`, `Executable`, `Source`, and `Section`. All options besides `ServerURLs` are optional. See [`Options`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Options) for the full list.
 
 ### Error handling
 
@@ -55,50 +55,59 @@ If any server returns the artifact, it is returned immediately. Otherwise the li
 
 ### Caching
 
-Two cache implementations ship with the library:
-
-- [`DiskCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#DiskCache), file-system-backed, persistent.
-- [`MemoryCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#MemoryCache), in-process, useful for tests and short-lived programs.
+The [`cache`](https://pkg.go.dev/go.kacmar.sk/debuginfod/cache) subpackage provides [`DiskCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod/cache#DiskCache), a filesystem-backed cache that wraps a `Client` (or any value implementing the package's `Fetcher` interface) and returns `*os.File` handles suitable for random-access reads, for example ELF parsing via [`debug/elf`](https://pkg.go.dev/debug/elf).
 
 ```go
+import (
+    "go.kacmar.sk/debuginfod"
+    "go.kacmar.sk/debuginfod/cache"
+    "go.kacmar.sk/debuginfod/key"
+)
+
 userCacheDir, err := os.UserCacheDir()
 if err != nil {
     return err
 }
 
-cache, err := debuginfod.NewDiskCache(debuginfod.DiskCacheOptions{
-    Dir: filepath.Join(userCacheDir, "debuginfod"),
+client, err := debuginfod.NewClient(debuginfod.Options{
+    ServerURLs: []string{"https://debuginfod.elfutils.org"},
 })
 if err != nil {
     return err
 }
-defer cache.Close()
 
-client, err := debuginfod.NewClient(debuginfod.Options{
-    ServerURLs: []string{"https://debuginfod.elfutils.org"},
-    Cache:      cache,
+disk, err := cache.NewDiskCache(cache.DiskCacheOptions{
+    Client: client,
+    Dir:    filepath.Join(userCacheDir, "debuginfod"),
 })
+if err != nil {
+    return err
+}
+defer disk.Close()
+
+f, err := disk.Get(ctx, key.DebugInfo(buildID))
+if err != nil {
+    return err
+}
+defer f.Close()
 ```
 
-`DiskCache` does not bound its own size or evict old entries. Manage the cache directory externally (e.g. a periodic sweep based on file `mtime`), or implement a custom `Cache` with the eviction policy you need.
+Writes commit atomically via a staging file. The cache is symlink-safe and refuses to follow symlinks pointing outside the cache directory. `Get` resolves cache hits without invoking the underlying `Client`. On a miss, the fetched response is streamed to disk and the committed file is returned.
 
-The returned `ReadCloser` streams bytes as they arrive from upstream and writes them into the cache. Closing it before `EOF` aborts the in-flight cache write so partial responses do not poison the cache.
+`DiskCache` does not bound its own size or delete old entries automatically. Use `Delete` to remove a single entry, or manage the cache directory externally (e.g. a periodic sweep based on file `mtime`).
 
-[`Cache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Cache) is an interface. Callers can plug in alternative storage backends (e.g. shared blob store, ring buffer, content-addressed object store) by implementing `Fetch`, `Stage`, and `Evict`.
-`Stage` returns a [`CacheEntry`](https://pkg.go.dev/go.kacmar.sk/debuginfod#CacheEntry) the library writes to and `Commit`s once the upstream response finishes.
-
-See [`MemoryCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod#MemoryCache) for a minimal reference implementation.
+`Get` does not coalesce concurrent requests for the same uncached key. All callers will fetch. Misses are not cached, so every `Get` for an absent artifact re-runs the federated lookup.
 
 ### Section requests
 
-`FetchSection` calls the upstream `/section` endpoint and returns its response. Not every debuginfod server implements `/section`, in which case `FetchSection` returns `ErrNotFound` and the client does not attempt any further action on its own.
+`Fetch` with a `key.Section` calls the upstream `/section` endpoint and returns its response. Not every debuginfod server implements `/section`, in which case the call returns `ErrNotFound` and the library does not attempt any further action on its own.
 The library never silently escalates a section request into a full debuginfo download, which is a policy decision left to the caller.
 
-If you want a section and the upstream cannot serve it, fetch the full debuginfo and extract the section locally with [`debug/elf`](https://pkg.go.dev/debug/elf).
+If you want a section and the upstream cannot serve it, fetch the full debuginfo and extract the section locally with [`debug/elf`](https://pkg.go.dev/debug/elf). The `cache.DiskCache` is well-suited to this pattern since it returns `*os.File`.
 
 ### Retries
 
-Each retry round fans out across all configured servers in parallel. Any HTTP response from any server is authoritative and ends the round, so only network failures trigger another round.
+Each retry round fans out across all configured servers in parallel. A body or an authoritative error (`ErrNotFound` or `ErrAuthRequired`) from any server ends the round. Transport errors (network failures plus 5xx and 429 responses) trigger another round.
 
 A cache miss requires every configured server to respond, since one server's 404 is not authoritative for the federation. Total latency on a miss is therefore bounded by the slowest server, not the fastest.
 
@@ -129,7 +138,7 @@ For shared or public servers, set `HTTPOptions.UserAgent` to identify your clien
 
 ### Logging
 
-Pass a `*slog.Logger` via `Options.Logger` to surface non-fatal events such as retry attempts and cache write failures. When unset, the library logs nothing.
+Pass a `*slog.Logger` via `Options.Logger` to surface non-fatal events such as retry attempts. When unset, the library logs nothing.
 
 ```go
 client, err := debuginfod.NewClient(debuginfod.Options{
@@ -144,7 +153,7 @@ The library does not impose timeouts of its own.
 
 Two knobs cover the common cases:
 
-- **Total budget** across all servers and retries: set a deadline on the `context.Context` passed to `Fetch*` methods. On a cache miss, this budget covers the slowest server, not the fastest (see [Retries](#retries)).
+- **Total budget** across all servers and retries: set a deadline on the `context.Context` passed to `Fetch`. On a cache miss, this budget covers the slowest server, not the fastest (see [Retries](#retries)).
 - **Per-attempt budget**: configure your own `*http.Client` via `HTTPOptions.Client` and use `http.Client.Timeout`, `Transport.ResponseHeaderTimeout`, or a custom `net.Dialer.Timeout` (wired through `Transport.DialContext`) to bound how long any single server request may stall.
 
 ## License

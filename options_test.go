@@ -7,11 +7,27 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+
+	"go.kacmar.sk/debuginfod/key"
 )
 
-func TestClient_RequiresServers(t *testing.T) {
-	if _, err := NewClient(Options{}); err == nil {
-		t.Error("expected error for no server URLs")
+func TestNewClient_RejectsInvalidOptions(t *testing.T) {
+	cases := []struct {
+		name string
+		opts Options
+	}{
+		{"NoServers", Options{}},
+		{"NegativeMaxRetries", Options{
+			ServerURLs: []string{"http://srv"},
+			HTTP:       HTTPOptions{MaxRetries: -1},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewClient(tc.opts); err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
 	}
 }
 
@@ -27,7 +43,7 @@ func TestClient_NormalizesServerURLs(t *testing.T) {
 		ServerURLs: []string{srv.URL, srv.URL + "/", srv.URL},
 	})
 
-	_, _ = client.FetchDebugInfo(context.Background(), testBuildID)
+	_, _ = client.Fetch(context.Background(), key.DebugInfo(testBuildID))
 
 	if got := hits.Load(); got != 1 {
 		t.Errorf("expected 1 request after URL normalization, got %d", got)
@@ -108,11 +124,10 @@ func TestClient_UserAgent(t *testing.T) {
 
 			client := mustNewClient(t, Options{
 				ServerURLs: []string{srv.URL},
-				Cache:      NewMemoryCache(),
 				HTTP:       HTTPOptions{UserAgent: tc.userAgent},
 			})
 
-			rc, err := client.FetchDebugInfo(context.Background(), testBuildID)
+			rc, err := client.Fetch(context.Background(), key.DebugInfo(testBuildID))
 			if err != nil {
 				t.Fatal(err)
 			}

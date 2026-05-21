@@ -7,26 +7,25 @@ import (
 	"io"
 	"log/slog"
 	"time"
+
+	"go.kacmar.sk/debuginfod/key"
 )
 
-// retrying wraps a source so that transport-level errors are retried with backoff.
-//
-// ErrNotFound and ErrAuthRequired are treated as authoritative and short-circuit the retry loop.
-// After maxRetries additional attempts, the last error is returned wrapped with a descriptive prefix.
-type retrying struct {
+// retrier retries transport errors with backoff. ErrNotFound and ErrAuthRequired short-circuit.
+type retrier struct {
 	inner      source
 	maxRetries int
 	backoff    func(retry int) time.Duration
 	logger     *slog.Logger
 }
 
-func newRetrying(inner source, maxRetries int, backoff func(int) time.Duration, logger *slog.Logger) *retrying {
-	return &retrying{inner: inner, maxRetries: maxRetries, backoff: backoff, logger: logger}
+func newRetrier(inner source, maxRetries int, backoff func(int) time.Duration, logger *slog.Logger) *retrier {
+	return &retrier{inner: inner, maxRetries: maxRetries, backoff: backoff, logger: logger}
 }
 
-func (r *retrying) Fetch(ctx context.Context, key Key) (io.ReadCloser, error) {
+func (r *retrier) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
 	for retry := 0; ; retry++ {
-		body, err := r.inner.Fetch(ctx, key)
+		body, err := r.inner.Fetch(ctx, k)
 		if err == nil {
 			return body, nil
 		}
@@ -38,7 +37,7 @@ func (r *retrying) Fetch(ctx context.Context, key Key) (io.ReadCloser, error) {
 		}
 		delay := r.backoff(retry + 1)
 		r.logger.Debug("retrying after backoff",
-			slog.String("key", key.String()),
+			slog.String("key", k.String()),
 			slog.Int("retry", retry+1),
 			slog.Duration("backoff", delay),
 		)

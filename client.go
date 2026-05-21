@@ -7,9 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
+
+	"go.kacmar.sk/debuginfod/key"
 )
 
 const (
@@ -33,50 +34,47 @@ var defaultUserAgent = sync.OnceValue(func() string {
 	return modulePath + "/" + version
 })
 
-// Client is a debuginfod client.
-//
-// A Client queries one or more upstream debuginfod servers, optionally backed by a cache.
-// A Client is safe for concurrent use.
+// source is a read-only origin for debuginfod artifacts.
+// An error wrapping ErrNotFound means the source authoritatively reports the artifact as absent.
+// Transport errors are retryable.
+type source interface {
+	Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error)
+}
+
+// Client queries one or more upstream debuginfod servers in parallel and returns the first body-bearing response.
 type Client struct {
 	source source
 }
 
 type Options struct {
-	// ServerURLs is the list of debuginfod server base URLs to query.
-	// All servers are queried in parallel.
+	// ServerURLs is the list of debuginfod server base URLs to query in parallel.
 	ServerURLs []string
 
-	// Cache is the artifact storage backend.
-	// If nil, no caching is performed.
-	Cache Cache
-
-	// HTTP configures the HTTP transport and retries.
 	HTTP HTTPOptions
 
-	// Logger is an optional structured logger.
-	// If nil, logging is disabled.
+	// Logger is an optional structured logger. If nil, logging is disabled.
 	Logger *slog.Logger
 }
 
 type HTTPOptions struct {
 	// Client is the HTTP client used for debuginfod requests.
-	// If nil, a client with a cloned http.DefaultTransport is used.
+	// Supply a custom client to inject authentication, configure TLS, or set per-attempt timeouts.
+	// If nil, a client wrapping a cloned http.DefaultTransport is used.
 	Client *http.Client
 
 	// MaxRetries is the maximum number of additional retry rounds after the initial attempt.
-	// Zero (the default) means no retries.
 	MaxRetries int
 
 	// Backoff returns the delay before retry round n (starting at 1).
 	// If nil, a default exponential backoff with jitter is used.
 	Backoff func(retry int) time.Duration
 
-	// UserAgent is the User-Agent header sent with requests.
+	// UserAgent is the User-Agent header sent on every request.
+	// If empty, defaults to "go.kacmar.sk/debuginfod/<version>".
 	UserAgent string
 }
 
-// NewClient creates a new Client with the given options.
-// Returns an error if no server URLs are provided or any URL is invalid.
+// NewClient validates opts and constructs a Client.
 func NewClient(opts Options) (*Client, error) {
 	if len(opts.ServerURLs) == 0 {
 		return nil, fmt.Errorf("debuginfod: no server URLs configured")
@@ -121,48 +119,23 @@ func NewClient(opts Options) (*Client, error) {
 
 	servers := make([]source, len(serverURLs))
 	for i, serverURL := range serverURLs {
-		servers[i] = &httpSource{
+		servers[i] = &upstream{
 			serverURL:  serverURL,
 			httpClient: httpClient,
 			userAgent:  userAgent,
 		}
 	}
 
-	network := newRetrying(newAuthoritativeRace(servers, logger), maxRetries, backoff, logger)
-	var pipeline source
-	if opts.Cache != nil {
-		pipeline = newChain([]source{opts.Cache, newTeeing(network, opts.Cache, logger)}, logger)
-	} else {
-		pipeline = network
-	}
+	pipeline := newRetrier(newRace(servers, logger), maxRetries, backoff, logger)
 
 	return &Client{source: pipeline}, nil
 }
 
-func (c *Client) fetch(ctx context.Context, key Key) (io.ReadCloser, error) {
-	key.BuildID = strings.ToLower(key.BuildID)
-	if err := key.Validate(); err != nil {
+// Fetch streams the artifact for k from the configured servers.
+// It returns ErrNotFound if no upstream has the artifact, ErrAuthRequired if at least one upstream needed auth and no other source could satisfy it, or a wrapped transport error after retries are exhausted.
+func (c *Client) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
+	if err := k.Validate(); err != nil {
 		return nil, err
 	}
-	return c.source.Fetch(ctx, key)
-}
-
-// FetchDebugInfo fetches the debug info file for buildID.
-func (c *Client) FetchDebugInfo(ctx context.Context, buildID string) (io.ReadCloser, error) {
-	return c.fetch(ctx, Key{BuildID: buildID, Kind: KindDebugInfo})
-}
-
-// FetchExecutable fetches the executable for buildID.
-func (c *Client) FetchExecutable(ctx context.Context, buildID string) (io.ReadCloser, error) {
-	return c.fetch(ctx, Key{BuildID: buildID, Kind: KindExecutable})
-}
-
-// FetchSource fetches a source file for buildID identified by its absolute sourcePath.
-func (c *Client) FetchSource(ctx context.Context, buildID string, sourcePath string) (io.ReadCloser, error) {
-	return c.fetch(ctx, Key{BuildID: buildID, Kind: KindSource, Qualifier: sourcePath})
-}
-
-// FetchSection fetches sectionName for buildID.
-func (c *Client) FetchSection(ctx context.Context, buildID string, sectionName string) (io.ReadCloser, error) {
-	return c.fetch(ctx, Key{BuildID: buildID, Kind: KindSection, Qualifier: sectionName})
+	return c.source.Fetch(ctx, k)
 }

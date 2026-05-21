@@ -7,21 +7,20 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"go.kacmar.sk/debuginfod/key"
 )
 
-// httpSource fetches artifacts from a single debuginfod server over HTTP.
-//
-// 200 returns the response body.
-// 401 and 403 produce ErrAuthRequired, other 4xx produce ErrNotFound.
-// 5xx, 429, and transport failures bubble up as retryable errors.
-type httpSource struct {
+// upstream fetches artifacts from a single debuginfod server.
+// 200 returns the response body, 401/403 produce ErrAuthRequired, other 4xx produce ErrNotFound, 5xx/429/transport failures bubble up as retryable errors.
+type upstream struct {
 	serverURL  string
 	httpClient *http.Client
 	userAgent  string
 }
 
-func (s *httpSource) Fetch(ctx context.Context, key Key) (io.ReadCloser, error) {
-	endpoint := s.serverURL + key.URLPath()
+func (s *upstream) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
+	endpoint := s.serverURL + buildURLPath(k)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -49,7 +48,26 @@ func (s *httpSource) Fetch(ctx context.Context, key Key) (io.ReadCloser, error) 
 	return resp.Body, nil
 }
 
-// normalizeServerURLs validates and canonicalizes server URLs, removing duplicates.
+// buildURLPath returns the debuginfod URL path for k. It assumes k is already validated.
+func buildURLPath(k key.Key) string {
+	base := "/buildid/" + k.BuildID() + "/" + k.Kind().String()
+	switch k.Kind() {
+	case key.KindSource:
+		return base + escapeSourcePath(k.Qualifier())
+	case key.KindSection:
+		return base + "/" + url.PathEscape(k.Qualifier())
+	}
+	return base
+}
+
+func escapeSourcePath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, segment := range parts {
+		parts[i] = url.PathEscape(segment)
+	}
+	return strings.Join(parts, "/")
+}
+
 func normalizeServerURLs(urls []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(urls))
 	out := make([]string, 0, len(urls))

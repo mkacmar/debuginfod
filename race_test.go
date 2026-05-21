@@ -8,51 +8,49 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
+
+	"go.kacmar.sk/debuginfod/key"
 )
 
 // blockUntilCancelled returns a fetch function that blocks until its context is cancelled,
 // then returns ctx.Err. Used to simulate a slow upstream that the race should cancel.
-func blockUntilCancelled() func(context.Context, Key) (io.ReadCloser, error) {
-	return func(ctx context.Context, _ Key) (io.ReadCloser, error) {
+func blockUntilCancelled() func(context.Context, key.Key) (io.ReadCloser, error) {
+	return func(ctx context.Context, _ key.Key) (io.ReadCloser, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 }
 
-func TestAuthoritativeRace_FastestWins(t *testing.T) {
+func TestRace_FastestWins(t *testing.T) {
 	winner := newStubSource(stubBytes(testPayload))
 	loser := newStubSource(blockUntilCancelled())
 
-	race := newAuthoritativeRace([]source{loser, winner}, discardLogger())
-	rc, err := race.Fetch(context.Background(), testKey)
+	r := newRace([]source{loser, winner}, discardLogger())
+	rc, err := r.Fetch(context.Background(), testKey)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	got, _ := io.ReadAll(rc)
-	rc.Close()
-
-	if !bytes.Equal(got, testPayload) {
+	if got := readAndClose(t, rc); !bytes.Equal(got, testPayload) {
 		t.Errorf("body = %q, want %q", got, testPayload)
 	}
 }
 
-func TestAuthoritativeRace_LosersAreCancelled(t *testing.T) {
+func TestRace_LosersAreCancelled(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var loserDone atomic.Bool
-		loser := newStubSource(func(ctx context.Context, _ Key) (io.ReadCloser, error) {
+		loser := newStubSource(func(ctx context.Context, _ key.Key) (io.ReadCloser, error) {
 			<-ctx.Done()
 			loserDone.Store(true)
 			return nil, ctx.Err()
 		})
 		winner := newStubSource(stubBytes(testPayload))
 
-		race := newAuthoritativeRace([]source{loser, winner}, discardLogger())
-		rc, err := race.Fetch(context.Background(), testKey)
+		r := newRace([]source{loser, winner}, discardLogger())
+		rc, err := r.Fetch(context.Background(), testKey)
 		if err != nil {
 			t.Fatalf("Fetch: %v", err)
 		}
-		io.ReadAll(rc)
-		rc.Close()
+		readAndClose(t, rc)
 
 		synctest.Wait()
 		if !loserDone.Load() {
@@ -61,16 +59,16 @@ func TestAuthoritativeRace_LosersAreCancelled(t *testing.T) {
 	})
 }
 
-func TestAuthoritativeRace_WinnerCloseCancelsContext(t *testing.T) {
+func TestRace_WinnerCloseCancelsContext(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var winnerCtx atomic.Pointer[context.Context]
-		winner := newStubSource(func(ctx context.Context, _ Key) (io.ReadCloser, error) {
+		winner := newStubSource(func(ctx context.Context, _ key.Key) (io.ReadCloser, error) {
 			winnerCtx.Store(&ctx)
 			return io.NopCloser(bytes.NewReader(testPayload)), nil
 		})
 
-		race := newAuthoritativeRace([]source{winner}, discardLogger())
-		rc, err := race.Fetch(context.Background(), testKey)
+		r := newRace([]source{winner}, discardLogger())
+		rc, err := r.Fetch(context.Background(), testKey)
 		if err != nil {
 			t.Fatalf("Fetch: %v", err)
 		}
@@ -96,7 +94,7 @@ func TestAuthoritativeRace_WinnerCloseCancelsContext(t *testing.T) {
 	})
 }
 
-func TestAuthoritativeRace_ErrorPriority(t *testing.T) {
+func TestRace_ErrorPriority(t *testing.T) {
 	transientA := errors.New("server A unreachable")
 	transientB := errors.New("server B unreachable")
 
@@ -142,8 +140,8 @@ func TestAuthoritativeRace_ErrorPriority(t *testing.T) {
 				sources[i] = newStubSource(stubError(e))
 			}
 
-			race := newAuthoritativeRace(sources, discardLogger())
-			_, err := race.Fetch(context.Background(), testKey)
+			r := newRace(sources, discardLogger())
+			_, err := r.Fetch(context.Background(), testKey)
 
 			for _, want := range tc.wantIs {
 				if !errors.Is(err, want) {
@@ -159,24 +157,23 @@ func TestAuthoritativeRace_ErrorPriority(t *testing.T) {
 	}
 }
 
-func TestAuthoritativeRace_LateLoserBodyIsClosed(t *testing.T) {
+func TestRace_LateLoserBodyIsClosed(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		closed := make(chan struct{}, 1)
 		lateBody := &observableBody{closed: closed}
 
 		winner := newStubSource(stubBytes(testPayload))
-		late := newStubSource(func(ctx context.Context, _ Key) (io.ReadCloser, error) {
+		late := newStubSource(func(ctx context.Context, _ key.Key) (io.ReadCloser, error) {
 			<-ctx.Done()
 			return lateBody, nil
 		})
 
-		race := newAuthoritativeRace([]source{winner, late}, discardLogger())
-		rc, err := race.Fetch(context.Background(), testKey)
+		r := newRace([]source{winner, late}, discardLogger())
+		rc, err := r.Fetch(context.Background(), testKey)
 		if err != nil {
 			t.Fatalf("Fetch: %v", err)
 		}
-		io.ReadAll(rc)
-		rc.Close()
+		readAndClose(t, rc)
 
 		synctest.Wait()
 		select {
