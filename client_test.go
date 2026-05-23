@@ -1,11 +1,14 @@
 package debuginfod
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -124,5 +127,76 @@ func TestClient_ContextCancellation(t *testing.T) {
 
 	if _, err := client.Fetch(ctx, testKey); err == nil {
 		t.Error("expected error from cancelled context")
+	}
+}
+
+// TestClient_PerUpstreamRetry_IndependentOf404Peer asserts that one upstream's 404 does not cancel retries on a peer that is transiently failing.
+func TestClient_PerUpstreamRetry_IndependentOf404Peer(t *testing.T) {
+	notFoundSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer notFoundSrv.Close()
+
+	var attempts atomic.Int32
+	transientSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "try again", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write(testPayload)
+	}))
+	defer transientSrv.Close()
+
+	noBackoff := func(int) time.Duration { return 0 }
+	client := mustNewClient(t, Options{
+		ServerURLs: []string{notFoundSrv.URL, transientSrv.URL},
+		HTTP: HTTPOptions{
+			MaxRetries: 2,
+			Backoff:    noBackoff,
+		},
+	})
+
+	rc, err := client.Fetch(context.Background(), testKey)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if got := readAndClose(t, rc); !bytes.Equal(got, testPayload) {
+		t.Errorf("body = %q, want %q", got, testPayload)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Errorf("transient server attempts = %d, want >= 2 (must be retried past initial 503)", got)
+	}
+}
+
+// TestClient_UnresolvedTransport_SuppressesNotFound asserts that a peer's authoritative 404 does not become the pool's verdict when another upstream remains unresolved.
+func TestClient_UnresolvedTransport_SuppressesNotFound(t *testing.T) {
+	notFoundSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer notFoundSrv.Close()
+
+	brokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusServiceUnavailable)
+	}))
+	defer brokenSrv.Close()
+
+	noBackoff := func(int) time.Duration { return 0 }
+	client := mustNewClient(t, Options{
+		ServerURLs: []string{notFoundSrv.URL, brokenSrv.URL},
+		HTTP: HTTPOptions{
+			MaxRetries: 1,
+			Backoff:    noBackoff,
+		},
+	})
+
+	_, err := client.Fetch(context.Background(), testKey)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, must not wrap ErrNotFound (unresolved transport error means pool verdict is unknown)", err)
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Errorf("err = %v, expected to wrap the 503 transport error", err)
 	}
 }

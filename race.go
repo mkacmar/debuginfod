@@ -10,10 +10,12 @@ import (
 )
 
 // race fans out a fetch to all sources in parallel and returns the first body-bearing response.
-// If every source errors, the result is, in order of precedence:
-//   - ErrNotFound, if any source reported absent
-//   - ErrAuthRequired, if any source reported auth required
-//   - errors.Join of all errors
+// If no source serves a body, the result follows this precedence:
+//   - errors.Join of every source's error, if any source returned an inconclusive error (i.e. neither ErrNotFound nor ErrAuthRequired).
+//   - ErrNotFound, if every source authoritatively responded and at least one reported absent.
+//   - ErrAuthRequired, if every source authoritatively responded and all reported auth required.
+//
+// Joined errors include authoritative sentinel messages for diagnostics but do not match errors.Is against them.
 type race struct {
 	sources []source
 	logger  *slog.Logger
@@ -21,12 +23,6 @@ type race struct {
 
 func newRace(sources []source, logger *slog.Logger) *race {
 	return &race{sources: sources, logger: logger}
-}
-
-type raceResult struct {
-	idx  int
-	body io.ReadCloser
-	err  error
 }
 
 func (r *race) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
@@ -44,8 +40,7 @@ func (r *race) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
 	}
 
 	var errs []error
-	notFound := false
-	authRequired := false
+	v := verdictUnset
 	for i := range n {
 		res := <-results
 		if res.body != nil {
@@ -58,39 +53,68 @@ func (r *race) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
 		}
 		switch {
 		case errors.Is(res.err, ErrNotFound):
-			notFound = true
+			v = max(v, verdictNotFound)
+			errs = append(errs, &nonAuthoritative{err: res.err})
 			r.logger.Debug("source reports absent",
 				slog.String("key", k.String()),
 				slog.Int("source", res.idx),
 				slog.Any("error", res.err),
 			)
 		case errors.Is(res.err, ErrAuthRequired):
-			authRequired = true
+			v = max(v, verdictAuthRequired)
+			errs = append(errs, &nonAuthoritative{err: res.err})
 			r.logger.Debug("source requires authentication",
 				slog.String("key", k.String()),
 				slog.Int("source", res.idx),
 				slog.Any("error", res.err),
 			)
 		default:
+			v = max(v, verdictInconclusive)
+			errs = append(errs, res.err)
 			r.logger.Debug("source unreachable",
 				slog.String("key", k.String()),
 				slog.Int("source", res.idx),
 				slog.Any("error", res.err),
 			)
 		}
-		errs = append(errs, res.err)
 	}
 	for _, cancel := range cancels {
 		cancel()
 	}
-	switch {
-	case notFound:
+	switch v {
+	case verdictInconclusive:
+		return nil, errors.Join(errs...)
+	case verdictNotFound:
 		return nil, ErrNotFound
-	case authRequired:
+	case verdictAuthRequired:
 		return nil, ErrAuthRequired
+	default:
+		panic("debuginfod: race finished without a body or an error")
 	}
-	return nil, errors.Join(errs...)
 }
+
+type raceResult struct {
+	idx  int
+	body io.ReadCloser
+	err  error
+}
+
+// verdict is the pool's overall conclusion after all sources have responded.
+type verdict int
+
+// Verdict constants are listed in ascending order of precedence: a higher value takes precedence over any lower value observed from another source.
+const (
+	verdictUnset verdict = iota
+	verdictAuthRequired
+	verdictNotFound
+	verdictInconclusive
+)
+
+// nonAuthoritative wraps an error so its message remains visible in a joined error.
+// It deliberately omits Unwrap to suppress errors.Is matches against sentinels like ErrNotFound or ErrAuthRequired.
+type nonAuthoritative struct{ err error }
+
+func (n *nonAuthoritative) Error() string { return n.err.Error() }
 
 func drainLosers(results <-chan raceResult, cancels []context.CancelFunc, winner, remaining int) {
 	for i, cancel := range cancels {

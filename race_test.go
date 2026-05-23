@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -99,20 +100,32 @@ func TestRace_ErrorPriority(t *testing.T) {
 	transientB := errors.New("server B unreachable")
 
 	cases := []struct {
-		name      string
-		errs      []error
-		wantIs    []error
-		wantNotIs []error
+		name         string
+		errs         []error
+		wantIs       []error
+		wantNotIs    []error
+		wantContains []string
 	}{
 		{
-			name:   "NotFoundBeatsTransportError",
-			errs:   []error{transientA, ErrNotFound},
-			wantIs: []error{ErrNotFound},
+			name:         "TransportErrorMakesNotFoundNonAuthoritative",
+			errs:         []error{transientA, ErrNotFound},
+			wantIs:       []error{transientA},
+			wantNotIs:    []error{ErrNotFound},
+			wantContains: []string{ErrNotFound.Error()},
 		},
 		{
-			name:   "AuthRequiredBeatsTransportError",
-			errs:   []error{transientA, ErrAuthRequired},
-			wantIs: []error{ErrAuthRequired},
+			name:         "TransportErrorMakesAuthRequiredNonAuthoritative",
+			errs:         []error{transientA, ErrAuthRequired},
+			wantIs:       []error{transientA},
+			wantNotIs:    []error{ErrAuthRequired},
+			wantContains: []string{ErrAuthRequired.Error()},
+		},
+		{
+			name:         "TransientAndBothAuthoritativeSentinels",
+			errs:         []error{transientA, ErrNotFound, ErrAuthRequired},
+			wantIs:       []error{transientA},
+			wantNotIs:    []error{ErrNotFound, ErrAuthRequired},
+			wantContains: []string{ErrNotFound.Error(), ErrAuthRequired.Error()},
 		},
 		{
 			name:      "NotFoundBeatsAuthRequired",
@@ -124,6 +137,12 @@ func TestRace_ErrorPriority(t *testing.T) {
 			name:   "AllNotFound",
 			errs:   []error{ErrNotFound, ErrNotFound},
 			wantIs: []error{ErrNotFound},
+		},
+		{
+			name:      "AllAuthRequired",
+			errs:      []error{ErrAuthRequired, ErrAuthRequired},
+			wantIs:    []error{ErrAuthRequired},
+			wantNotIs: []error{ErrNotFound},
 		},
 		{
 			name:      "AllTransportErrorsJoined",
@@ -143,6 +162,9 @@ func TestRace_ErrorPriority(t *testing.T) {
 			r := newRace(sources, discardLogger())
 			_, err := r.Fetch(context.Background(), testKey)
 
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
 			for _, want := range tc.wantIs {
 				if !errors.Is(err, want) {
 					t.Errorf("err = %v, want errors.Is(_, %v) == true", err, want)
@@ -151,6 +173,12 @@ func TestRace_ErrorPriority(t *testing.T) {
 			for _, notWant := range tc.wantNotIs {
 				if errors.Is(err, notWant) {
 					t.Errorf("err = %v, must not wrap %v", err, notWant)
+				}
+			}
+			msg := err.Error()
+			for _, want := range tc.wantContains {
+				if !strings.Contains(msg, want) {
+					t.Errorf("err message %q should contain %q for diagnostics", msg, want)
 				}
 			}
 		})

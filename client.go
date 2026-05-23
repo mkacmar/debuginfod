@@ -119,14 +119,14 @@ func NewClient(opts Options) (*Client, error) {
 
 	servers := make([]source, len(serverURLs))
 	for i, serverURL := range serverURLs {
-		servers[i] = &upstream{
+		servers[i] = newRetrier(&upstream{
 			serverURL:  serverURL,
 			httpClient: httpClient,
 			userAgent:  userAgent,
-		}
+		}, maxRetries, backoff, logger)
 	}
 
-	pipeline := newRetrier(newRace(servers, logger), maxRetries, backoff, logger)
+	pipeline := newRace(servers, logger)
 
 	return &Client{source: pipeline}, nil
 }
