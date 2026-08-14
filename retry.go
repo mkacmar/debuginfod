@@ -23,17 +23,17 @@ func newRetrier(inner source, maxRetries int, backoff func(int) time.Duration, l
 	return &retrier{inner: inner, maxRetries: maxRetries, backoff: backoff, logger: logger}
 }
 
-func (r *retrier) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
+func (r *retrier) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, Metadata, error) {
 	for retry := 0; ; retry++ {
-		body, err := r.inner.Fetch(ctx, k)
+		body, meta, err := r.inner.Fetch(ctx, k)
 		if err == nil {
-			return body, nil
+			return body, meta, nil
 		}
 		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrAuthRequired) {
-			return nil, err
+			return nil, Metadata{}, err
 		}
 		if retry >= r.maxRetries {
-			return nil, fmt.Errorf("debuginfod: retries exhausted: %w", err)
+			return nil, Metadata{}, fmt.Errorf("debuginfod: retries exhausted: %w", err)
 		}
 		delay := r.backoff(retry + 1)
 		r.logger.Debug("retrying after backoff",
@@ -45,7 +45,7 @@ func (r *retrier) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, ctx.Err()
+			return nil, Metadata{}, ctx.Err()
 		case <-timer.C:
 		}
 	}

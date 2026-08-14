@@ -27,12 +27,35 @@ func TestRace_FastestWins(t *testing.T) {
 	loser := newStubSource(blockUntilCancelled())
 
 	r := newRace([]source{loser, winner}, discardLogger())
-	rc, err := r.Fetch(context.Background(), testKey)
+	rc, _, err := r.Fetch(context.Background(), testKey)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 	if got := readAndClose(t, rc); !bytes.Equal(got, testPayload) {
 		t.Errorf("body = %q, want %q", got, testPayload)
+	}
+}
+
+// TestRace_WinnerMetadataIsReturned pairs the returned metadata with the body that won.
+// The winner is placed last so returning any other source's metadata, or the zero value, fails here.
+func TestRace_WinnerMetadataIsReturned(t *testing.T) {
+	late := newStubSource(func(ctx context.Context, _ key.Key) (io.ReadCloser, error) {
+		<-ctx.Done()
+		return io.NopCloser(bytes.NewReader(testPayload)), nil
+	})
+	late.meta = Metadata{File: "late.debug", Size: 99}
+	winner := newStubSource(stubBytes(testPayload))
+	winner.meta = Metadata{File: "winner.debug", Size: 7}
+
+	r := newRace([]source{late, winner}, discardLogger())
+	rc, meta, err := r.Fetch(context.Background(), testKey)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	readAndClose(t, rc)
+
+	if meta.File != "winner.debug" || meta.Size != 7 {
+		t.Errorf("Meta = %+v, want the winner's (File=winner.debug Size=7)", meta)
 	}
 }
 
@@ -47,7 +70,7 @@ func TestRace_LosersAreCancelled(t *testing.T) {
 		winner := newStubSource(stubBytes(testPayload))
 
 		r := newRace([]source{loser, winner}, discardLogger())
-		rc, err := r.Fetch(context.Background(), testKey)
+		rc, _, err := r.Fetch(context.Background(), testKey)
 		if err != nil {
 			t.Fatalf("Fetch: %v", err)
 		}
@@ -69,7 +92,7 @@ func TestRace_WinnerCloseCancelsContext(t *testing.T) {
 		})
 
 		r := newRace([]source{winner}, discardLogger())
-		rc, err := r.Fetch(context.Background(), testKey)
+		rc, _, err := r.Fetch(context.Background(), testKey)
 		if err != nil {
 			t.Fatalf("Fetch: %v", err)
 		}
@@ -160,7 +183,7 @@ func TestRace_ErrorPriority(t *testing.T) {
 			}
 
 			r := newRace(sources, discardLogger())
-			_, err := r.Fetch(context.Background(), testKey)
+			_, _, err := r.Fetch(context.Background(), testKey)
 
 			if err == nil {
 				t.Fatal("expected error, got nil")
@@ -197,7 +220,7 @@ func TestRace_LateLoserBodyIsClosed(t *testing.T) {
 		})
 
 		r := newRace([]source{winner, late}, discardLogger())
-		rc, err := r.Fetch(context.Background(), testKey)
+		rc, _, err := r.Fetch(context.Background(), testKey)
 		if err != nil {
 			t.Fatalf("Fetch: %v", err)
 		}

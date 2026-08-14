@@ -62,8 +62,10 @@ func readAndClose(t *testing.T, rc io.ReadCloser) []byte {
 
 // stubSource is a source whose Fetch behavior is controlled by a caller-supplied function.
 // It records every call for inspection.
+// Set meta to give the source distinct metadata, so tests can assert whose metadata a decorator returns.
 type stubSource struct {
 	fetch func(ctx context.Context, k key.Key) (io.ReadCloser, error)
+	meta  Metadata
 
 	mu    sync.Mutex
 	calls []key.Key
@@ -73,11 +75,15 @@ func newStubSource(fetch func(ctx context.Context, k key.Key) (io.ReadCloser, er
 	return &stubSource{fetch: fetch}
 }
 
-func (s *stubSource) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
+func (s *stubSource) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, Metadata, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, k)
 	s.mu.Unlock()
-	return s.fetch(ctx, k)
+	rc, err := s.fetch(ctx, k)
+	if err != nil {
+		return rc, Metadata{}, err
+	}
+	return rc, s.meta, nil
 }
 
 func (s *stubSource) callCount() int {

@@ -72,6 +72,28 @@ func TestClient_Fetch(t *testing.T) {
 	}
 }
 
+func TestClient_FetchExposesMetadata(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-DEBUGINFOD-FILE", "libc.so.6")
+		w.Header().Set("X-DEBUGINFOD-SIZE", "42")
+		_, _ = w.Write([]byte("data"))
+	}))
+	defer srv.Close()
+
+	client := mustNewClient(t, Options{ServerURLs: []string{srv.URL}})
+
+	resp, err := client.Fetch(context.Background(), testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Meta.File != "libc.so.6" || resp.Meta.Size != 42 {
+		t.Errorf("Meta = %+v, want File=libc.so.6 Size=42", resp.Meta)
+	}
+	if got := readAndClose(t, resp); string(got) != "data" {
+		t.Errorf("body = %q, want %q", got, "data")
+	}
+}
+
 func TestClient_UppercaseBuildIDLowercased(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

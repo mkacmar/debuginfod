@@ -25,7 +25,7 @@ func newRace(sources []source, logger *slog.Logger) *race {
 	return &race{sources: sources, logger: logger}
 }
 
-func (r *race) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
+func (r *race) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, Metadata, error) {
 	n := len(r.sources)
 	cancels := make([]context.CancelFunc, n)
 	results := make(chan raceResult, n)
@@ -34,8 +34,8 @@ func (r *race) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
 		srcCtx, cancel := context.WithCancel(ctx) // #nosec G118 -- cancel is stored in cancels[i] and invoked either via drainLosers on a winner or via the cleanup loop below
 		cancels[i] = cancel
 		go func(i int, src source, ctx context.Context) {
-			body, err := src.Fetch(ctx, k)
-			results <- raceResult{i, body, err}
+			body, meta, err := src.Fetch(ctx, k)
+			results <- raceResult{i, body, meta, err}
 		}(i, src, srcCtx)
 	}
 
@@ -49,7 +49,7 @@ func (r *race) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
 				slog.Int("source", res.idx),
 			)
 			go drainLosers(results, cancels, res.idx, n-i-1)
-			return &cancelOnClose{ReadCloser: res.body, cancel: cancels[res.idx]}, nil
+			return &cancelOnClose{ReadCloser: res.body, cancel: cancels[res.idx]}, res.meta, nil
 		}
 		switch {
 		case errors.Is(res.err, ErrNotFound):
@@ -83,11 +83,11 @@ func (r *race) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
 	}
 	switch v {
 	case verdictInconclusive:
-		return nil, errors.Join(errs...)
+		return nil, Metadata{}, errors.Join(errs...)
 	case verdictNotFound:
-		return nil, ErrNotFound
+		return nil, Metadata{}, ErrNotFound
 	case verdictAuthRequired:
-		return nil, ErrAuthRequired
+		return nil, Metadata{}, ErrAuthRequired
 	default:
 		panic("debuginfod: race finished without a body or an error")
 	}
@@ -96,6 +96,7 @@ func (r *race) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
 type raceResult struct {
 	idx  int
 	body io.ReadCloser
+	meta Metadata
 	err  error
 }
 

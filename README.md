@@ -35,12 +35,14 @@ if err != nil {
     return err
 }
 
-rc, err := client.Fetch(ctx, key.DebugInfo(buildID))
+resp, err := client.Fetch(ctx, key.DebugInfo(buildID))
 if err != nil {
     return err
 }
-defer rc.Close()
+defer resp.Close()
 ```
+
+`Fetch` returns a [`Response`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Response) that embeds an `io.ReadCloser` for the body alongside a `Meta` field. `Meta` carries the server's `X-DEBUGINFOD-*` response headers, which include the size, the suggested file name, the source archive, and the per-file IMA signature. Because the reader is embedded, you can call `Read` and `Close` directly on the `Response`, and each field is left at its zero value whenever the server omits the corresponding header.
 
 The [`key`](https://pkg.go.dev/go.kacmar.sk/debuginfod/key) package exposes constructors for the four artifact kinds: `DebugInfo`, `Executable`, `Source`, and `Section`. All options besides `ServerURLs` are optional. See [`Options`](https://pkg.go.dev/go.kacmar.sk/debuginfod#Options) for the full list.
 
@@ -48,14 +50,14 @@ The [`key`](https://pkg.go.dev/go.kacmar.sk/debuginfod/key) package exposes cons
 
 If any server returns the artifact, it is returned immediately. Otherwise the library waits for every server to respond and reports one of:
 
-- [`ErrNotFound`](https://pkg.go.dev/go.kacmar.sk/debuginfod#ErrNotFound), if at least one server returned 404 or 410. Treat as a definitive absence.
-- [`ErrAuthRequired`](https://pkg.go.dev/go.kacmar.sk/debuginfod#ErrAuthRequired), if no server returned 404 or 410 and at least one returned 401 or 403. Treat as a hint to provide credentials.
+- [`ErrNotFound`](https://pkg.go.dev/go.kacmar.sk/debuginfod#ErrNotFound) when at least one server returned 404 or 410, a definitive absence.
+- [`ErrAuthRequired`](https://pkg.go.dev/go.kacmar.sk/debuginfod#ErrAuthRequired) when no server returned 404 or 410 and at least one returned 401 or 403, a hint to provide credentials.
 
-5xx and 429 responses propagate as transport errors and are retried. All other 4xx codes are folded into `ErrNotFound`.
+5xx and 429 responses propagate as transport errors and are retried, while all other 4xx codes are folded into `ErrNotFound`.
 
 ### Caching
 
-The [`cache`](https://pkg.go.dev/go.kacmar.sk/debuginfod/cache) subpackage provides [`DiskCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod/cache#DiskCache), a filesystem-backed cache that wraps a `Client` (or any value implementing the package's `Fetcher` interface) and returns `*os.File` handles suitable for random-access reads, for example ELF parsing via [`debug/elf`](https://pkg.go.dev/debug/elf).
+The [`cache`](https://pkg.go.dev/go.kacmar.sk/debuginfod/cache) subpackage provides [`DiskCache`](https://pkg.go.dev/go.kacmar.sk/debuginfod/cache#DiskCache), a filesystem-backed cache that wraps a `Client` (or any value implementing the package's `Fetcher` interface) and returns [`Entry`](https://pkg.go.dev/go.kacmar.sk/debuginfod/cache#Entry) handles suitable for random-access reads, for example ELF parsing via [`debug/elf`](https://pkg.go.dev/debug/elf). An `Entry` embeds an `*os.File` (so `ReadAt`, `Close`, and `Name` work directly) and carries the artifact's `Meta`.
 
 ```go
 import (
@@ -85,25 +87,28 @@ if err != nil {
 }
 defer disk.Close()
 
-f, err := disk.Get(ctx, key.DebugInfo(buildID))
+entry, err := disk.Get(ctx, key.DebugInfo(buildID))
 if err != nil {
     return err
 }
-defer f.Close()
+defer entry.Close()
 ```
 
-Writes commit atomically via a staging file. The cache is symlink-safe and refuses to follow symlinks pointing outside the cache directory. `Get` resolves cache hits without invoking the underlying `Client`. On a miss, the fetched response is streamed to disk and the committed file is returned.
+Writes commit atomically through a staging file, and the cache is symlink-safe because it refuses to follow symlinks that point outside the cache directory. `Get` resolves cache hits without invoking the underlying `Client`, and on a miss it streams the fetched response to disk before returning the committed file.
 
-`DiskCache` does not bound its own size or delete old entries automatically. Use `Delete` to remove a single entry, or manage the cache directory externally (e.g. a periodic sweep based on file `mtime`).
+Response metadata is persisted in a per-buildID `.meta/` subdirectory that mirrors the body layout, so the sidecar for `<buildID>/debuginfo` lives at `<buildID>/.meta/debuginfo`. As a result, `entry.Meta` is populated on both cold fetches and warm hits, and removing a build ID directory removes its metadata in the same step, which keeps external cleanup simple.
 
-`Get` does not coalesce concurrent requests for the same uncached key. All callers will fetch. Misses are not cached, so every `Get` for an absent artifact re-runs the federated lookup.
+When a sidecar is missing or cannot be decoded, the metadata is treated as unknown and `Meta` comes back as its zero value rather than failing the read. That covers entries cached before metadata support existed as well as the occasional corrupt file.
+
+`DiskCache` does not bound its own size or delete old entries automatically. You can use `Delete` to remove a single entry, or manage the cache directory externally with something like a periodic sweep based on file `mtime`.
+
+`Get` does not coalesce concurrent requests for the same uncached key, so every caller fetches independently. Misses are not cached either, which means every `Get` for an absent artifact re-runs the federated lookup.
 
 ### Section requests
 
-`Fetch` with a `key.Section` calls the upstream `/section` endpoint and returns its response. Not every debuginfod server implements `/section`, in which case the call returns `ErrNotFound` and the library does not attempt any further action on its own.
-The library never silently escalates a section request into a full debuginfo download, which is a policy decision left to the caller.
+`Fetch` with a `key.Section` calls the upstream `/section` endpoint and returns its response. Not every debuginfod server implements `/section`, in which case the call returns `ErrNotFound` and the library does not attempt any further action on its own. The library never silently escalates a section request into a full debuginfo download, because that is a policy decision left to the caller.
 
-If you want a section and the upstream cannot serve it, fetch the full debuginfo and extract the section locally with [`debug/elf`](https://pkg.go.dev/debug/elf). The `cache.DiskCache` is well-suited to this pattern since it returns `*os.File`.
+If you want a section and the upstream cannot serve it, fetch the full debuginfo and extract the section locally with [`debug/elf`](https://pkg.go.dev/debug/elf). The `cache.DiskCache` is well-suited to this pattern since its `Entry` embeds an `*os.File`.
 
 ### Retries
 

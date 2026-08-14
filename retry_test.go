@@ -60,7 +60,7 @@ func TestRetrier_SucceedsAfter(t *testing.T) {
 			backoff := &backoffRecorder{}
 
 			r := newRetrier(inner, tc.maxRetries, backoff.fn, discardLogger())
-			rc, err := r.Fetch(context.Background(), testKey)
+			rc, _, err := r.Fetch(context.Background(), testKey)
 			if err != nil {
 				t.Fatalf("Fetch: %v", err)
 			}
@@ -73,6 +73,32 @@ func TestRetrier_SucceedsAfter(t *testing.T) {
 				t.Errorf("backoff rounds = %v, want %v", got, tc.wantRounds)
 			}
 		})
+	}
+}
+
+// TestRetrier_MetadataSurvivesRetry asserts the successful attempt's metadata is returned, not the zero value the failed attempts produce.
+func TestRetrier_MetadataSurvivesRetry(t *testing.T) {
+	transient := errors.New("connection refused")
+	var attempts int
+	inner := newStubSource(func(_ context.Context, _ key.Key) (io.ReadCloser, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, transient
+		}
+		return io.NopCloser(bytes.NewReader(testPayload)), nil
+	})
+	inner.meta = Metadata{File: "libc.so.6", Size: 42}
+	backoff := &backoffRecorder{}
+
+	r := newRetrier(inner, 3, backoff.fn, discardLogger())
+	rc, meta, err := r.Fetch(context.Background(), testKey)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	readAndClose(t, rc)
+
+	if meta.File != "libc.so.6" || meta.Size != 42 {
+		t.Errorf("Meta = %+v, want File=libc.so.6 Size=42", meta)
 	}
 }
 
@@ -91,7 +117,7 @@ func TestRetrier_TerminalErrorsShortCircuit(t *testing.T) {
 			backoff := &backoffRecorder{}
 
 			r := newRetrier(inner, 5, backoff.fn, discardLogger())
-			_, err := r.Fetch(context.Background(), testKey)
+			_, _, err := r.Fetch(context.Background(), testKey)
 			if !errors.Is(err, tc.err) {
 				t.Errorf("err = %v, want %v", err, tc.err)
 			}
@@ -124,7 +150,7 @@ func TestRetrier_ExhaustsRetries(t *testing.T) {
 			backoff := &backoffRecorder{}
 
 			r := newRetrier(inner, tc.maxRetries, backoff.fn, discardLogger())
-			_, err := r.Fetch(context.Background(), testKey)
+			_, _, err := r.Fetch(context.Background(), testKey)
 			if !errors.Is(err, transient) {
 				t.Errorf("err = %v, does not wrap %v", err, transient)
 			}
@@ -147,7 +173,7 @@ func TestRetrier_ContextCancellationDuringBackoff(t *testing.T) {
 	cancel()
 
 	r := newRetrier(inner, 5, backoff.fn, discardLogger())
-	_, err := r.Fetch(ctx, testKey)
+	_, _, err := r.Fetch(ctx, testKey)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}

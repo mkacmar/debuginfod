@@ -38,7 +38,7 @@ var defaultUserAgent = sync.OnceValue(func() string {
 // An error wrapping ErrNotFound means the source authoritatively reports the artifact as absent.
 // Transport errors are retryable.
 type source interface {
-	Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error)
+	Fetch(ctx context.Context, k key.Key) (io.ReadCloser, Metadata, error)
 }
 
 // Client queries one or more upstream debuginfod servers in parallel and returns the first body-bearing response.
@@ -133,9 +133,13 @@ func NewClient(opts Options) (*Client, error) {
 
 // Fetch streams the artifact for k from the configured servers.
 // It returns ErrNotFound if no upstream has the artifact, ErrAuthRequired if at least one upstream needed auth and no other source could satisfy it, or a wrapped transport error after retries are exhausted.
-func (c *Client) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
+func (c *Client) Fetch(ctx context.Context, k key.Key) (Response, error) {
 	if err := k.Validate(); err != nil {
-		return nil, err
+		return Response{}, err
 	}
-	return c.source.Fetch(ctx, k)
+	body, meta, err := c.source.Fetch(ctx, k)
+	if err != nil {
+		return Response{}, err
+	}
+	return Response{ReadCloser: body, Meta: meta}, nil
 }

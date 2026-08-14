@@ -2,6 +2,7 @@ package debuginfod
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -24,12 +25,64 @@ func TestUpstream_SuccessReturnsBody(t *testing.T) {
 	srv := staticServer(t, body)
 
 	src := newTestUpstream(srv.URL)
-	rc, err := src.Fetch(context.Background(), testKey)
+	rc, _, err := src.Fetch(context.Background(), testKey)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 	if got := readAndClose(t, rc); string(got) != body {
 		t.Errorf("body = %q, want %q", got, body)
+	}
+}
+
+func TestUpstream_ParsesMetadataHeaders(t *testing.T) {
+	imaHex := "deadbeef"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-DEBUGINFOD-SIZE", "12345")
+		w.Header().Set("X-DEBUGINFOD-FILE", "/usr/lib/debug/ls.debug")
+		w.Header().Set("X-DEBUGINFOD-ARCHIVE", "/path/coreutils.rpm")
+		w.Header().Set("X-DEBUGINFOD-IMASIGNATURE", imaHex)
+		fmt.Fprint(w, "body")
+	}))
+	defer srv.Close()
+
+	src := newTestUpstream(srv.URL)
+	rc, meta, err := src.Fetch(context.Background(), testKey)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	readAndClose(t, rc)
+
+	if meta.Size != 12345 {
+		t.Errorf("Size = %d, want 12345", meta.Size)
+	}
+	if meta.File != "/usr/lib/debug/ls.debug" {
+		t.Errorf("File = %q, want /usr/lib/debug/ls.debug", meta.File)
+	}
+	if meta.Archive != "/path/coreutils.rpm" {
+		t.Errorf("Archive = %q, want /path/coreutils.rpm", meta.Archive)
+	}
+	if got := hex.EncodeToString(meta.IMASignature); got != imaHex {
+		t.Errorf("IMASignature = %q, want %q", got, imaHex)
+	}
+}
+
+func TestUpstream_MetadataBestEffort(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-DEBUGINFOD-SIZE", "not-a-number")
+		w.Header().Set("X-DEBUGINFOD-IMASIGNATURE", "zzzz")
+		fmt.Fprint(w, "body")
+	}))
+	defer srv.Close()
+
+	src := newTestUpstream(srv.URL)
+	rc, meta, err := src.Fetch(context.Background(), testKey)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	readAndClose(t, rc)
+
+	if meta.Size != 0 || meta.File != "" || meta.Archive != "" || meta.IMASignature != nil {
+		t.Errorf("malformed/absent headers should yield zero Metadata, got %+v", meta)
 	}
 }
 
@@ -42,7 +95,7 @@ func TestUpstream_SendsUserAgent(t *testing.T) {
 	defer srv.Close()
 
 	src := &upstream{serverURL: srv.URL, httpClient: http.DefaultClient, userAgent: "my-agent/1.0"}
-	rc, err := src.Fetch(context.Background(), testKey)
+	rc, _, err := src.Fetch(context.Background(), testKey)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -83,7 +136,7 @@ func TestUpstream_StatusMapping(t *testing.T) {
 			defer srv.Close()
 
 			src := newTestUpstream(srv.URL)
-			_, err := src.Fetch(context.Background(), testKey)
+			_, _, err := src.Fetch(context.Background(), testKey)
 			if err == nil {
 				t.Fatalf("status %d: expected error", tc.code)
 			}
@@ -99,7 +152,7 @@ func TestUpstream_StatusMapping(t *testing.T) {
 
 func TestUpstream_NetworkErrorIsNotErrNotFound(t *testing.T) {
 	src := newTestUpstream(unreachableURL(t))
-	_, err := src.Fetch(context.Background(), testKey)
+	_, _, err := src.Fetch(context.Background(), testKey)
 	if err == nil {
 		t.Fatal("expected error from unreachable server")
 	}
@@ -121,7 +174,7 @@ func TestUpstream_PropagatesContextCancellation(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := src.Fetch(ctx, testKey)
+		_, _, err := src.Fetch(ctx, testKey)
 		errCh <- err
 	}()
 

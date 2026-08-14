@@ -2,10 +2,12 @@ package debuginfod
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"go.kacmar.sk/debuginfod/key"
@@ -19,33 +21,49 @@ type upstream struct {
 	userAgent  string
 }
 
-func (s *upstream) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, error) {
+func (s *upstream) Fetch(ctx context.Context, k key.Key) (io.ReadCloser, Metadata, error) {
 	endpoint := s.serverURL + buildURLPath(k)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", s.serverURL, err)
+		return nil, Metadata{}, fmt.Errorf("%s: %w", s.serverURL, err)
 	}
 	req.Header.Set("User-Agent", s.userAgent)
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", s.serverURL, err)
+		return nil, Metadata{}, fmt.Errorf("%s: %w", s.serverURL, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
 		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
-			return nil, fmt.Errorf("%s: server returned %d", s.serverURL, resp.StatusCode)
+			return nil, Metadata{}, fmt.Errorf("%s: server returned %d", s.serverURL, resp.StatusCode)
 		}
 		sentinel := ErrNotFound
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			sentinel = ErrAuthRequired
 		}
-		return nil, fmt.Errorf("%s: server returned %d: %w", s.serverURL, resp.StatusCode, sentinel)
+		return nil, Metadata{}, fmt.Errorf("%s: server returned %d: %w", s.serverURL, resp.StatusCode, sentinel)
 	}
 
-	return resp.Body, nil
+	return resp.Body, parseMetadata(resp.Header), nil
+}
+
+// parseMetadata extracts the X-DEBUGINFOD-* response headers into a Metadata.
+// Parsing is best-effort: malformed values leave their field zero rather than failing the fetch.
+func parseMetadata(h http.Header) Metadata {
+	meta := Metadata{
+		File:    h.Get("X-DEBUGINFOD-FILE"),
+		Archive: h.Get("X-DEBUGINFOD-ARCHIVE"),
+	}
+	if size, err := strconv.ParseInt(h.Get("X-DEBUGINFOD-SIZE"), 10, 64); err == nil {
+		meta.Size = size
+	}
+	if sig, err := hex.DecodeString(h.Get("X-DEBUGINFOD-IMASIGNATURE")); err == nil && len(sig) > 0 {
+		meta.IMASignature = sig
+	}
+	return meta
 }
 
 // buildURLPath returns the debuginfod URL path for k. It assumes k is already validated.
