@@ -18,7 +18,7 @@ See [API documentation](https://pkg.go.dev/go.kacmar.sk/debuginfod) for details.
 go get go.kacmar.sk/debuginfod
 ```
 
-Requires Go 1.25 or later.
+Requires Go 1.26 or later.
 
 ## Usage
 
