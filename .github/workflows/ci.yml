@@ -29,9 +29,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install tools
-        run: make install-tools
-
       - name: Lint
         run: make lint
 

@@ -1,17 +1,14 @@
-.PHONY: test lint fmt install-tools
+.PHONY: test lint fmt
+
+TOOL = go tool -modfile=tools/tools.mod
 
 test:
 	go test -v -race ./...
 
 lint:
 	go vet ./...
-	staticcheck ./...
-	gosec -quiet ./...
+	$(TOOL) staticcheck ./...
+	$(TOOL) gosec -quiet ./...
 
 fmt:
-	goimports -l -w .
-
-install-tools:
-	go install golang.org/x/tools/cmd/goimports@v0.49.0
-	go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
-	go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+	$(TOOL) goimports -l -w .
